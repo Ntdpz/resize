@@ -29,6 +29,7 @@ PREVIEW_IMAGE_SIZE = (320, 220)
 LOGO_PREVIEW_SIZE = (180, 180)
 SOURCE_PREVIEW_SIZE = (220, 220)
 RESULT_CANVAS_SIZE = (360, 520)
+GALLERY_THUMBNAIL_SIZE = (72, 72)
 
 
 class AutoWatermarkWindow(ctk.CTk):
@@ -43,6 +44,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self.selected_paths: tuple[Path, ...] = ()
         self.preview_source_path: Path | None = None
         self.last_output_folder: Path | None = None
+        self.image_settings_by_path: dict[Path, PlacementSettings] = {}
 
         self._worker: threading.Thread | None = None
         self._events: queue.Queue[AppEvent] = queue.Queue()
@@ -55,6 +57,8 @@ class AutoWatermarkWindow(ctk.CTk):
         self._result_preview_anchor_position: tuple[int, int] | None = None
         self._result_preview_drag_origin: tuple[int, int] | None = None
         self._result_preview_drag_position: tuple[int, int] | None = None
+        self._gallery_thumbnail_images: dict[Path, ctk.CTkImage] = {}
+        self._gallery_buttons: dict[Path, ctk.CTkButton] = {}
 
         self.selection_mode_var = ctk.StringVar(value="folder")
         self.output_size_var = ctk.StringVar(value=OUTPUT_SIZE_RESIZE_1280)
@@ -71,6 +75,9 @@ class AutoWatermarkWindow(ctk.CTk):
             value="ยังไม่ได้เลือกรูปหรือโฟลเดอร์"
         )
         self.image_count_var = ctk.StringVar(value="โหมดโฟลเดอร์")
+        self.gallery_status_var = ctk.StringVar(
+            value="Gallery จะแสดงเมื่อเลือกโฟลเดอร์"
+        )
         self.output_size_note_var = ctk.StringVar(
             value="ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
         )
@@ -209,9 +216,31 @@ class AutoWatermarkWindow(ctk.CTk):
             row=4,
             column=0,
             padx=18,
+            pady=(0, 12),
+            sticky="ew",
+        )
+
+        ctk.CTkLabel(
+            source_card,
+            text="Gallery / รายการรูป",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=5, column=0, padx=18, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(
+            source_card,
+            textvariable=self.gallery_status_var,
+            wraplength=340,
+            justify="left",
+            text_color=("#5b6472", "#b0b8c4"),
+        ).grid(row=6, column=0, padx=18, pady=(0, 8), sticky="w")
+        self.gallery_frame = ctk.CTkScrollableFrame(source_card, height=220)
+        self.gallery_frame.grid(
+            row=7,
+            column=0,
+            padx=18,
             pady=(0, 18),
             sticky="ew",
         )
+        self.gallery_frame.grid_columnconfigure(0, weight=1)
 
     def _build_controls_section(self, parent: ctk.CTkFrame) -> None:
         controls = ctk.CTkFrame(parent)
@@ -581,9 +610,11 @@ class AutoWatermarkWindow(ctk.CTk):
         ).grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
 
     def _on_selection_mode_changed(self, mode: str) -> None:
+        self._persist_current_preview_settings()
         self.selection_mode_var.set(mode)
         self.selection_anchor_path = None
         self.selected_paths = ()
+        self.image_settings_by_path = {}
         self.source_name_var.set("ยังไม่ได้เลือกรูปหรือโฟลเดอร์")
         self.image_count_var.set(
             "โหมดโฟลเดอร์" if mode == "folder" else "โหมดรูปเดี่ยว"
@@ -595,6 +626,7 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self.source_picker_button.configure(text=button_text)
         self._update_source_picker_command()
+        self._refresh_gallery()
         self._set_status("สลับโหมดเลือกต้นฉบับแล้ว")
         self._render_previews()
 
@@ -634,13 +666,20 @@ class AutoWatermarkWindow(ctk.CTk):
         if not selection:
             return
 
+        self._persist_current_preview_settings()
         self._clear_result_preview_state()
         selected_path = Path(selection)
         self.selection_anchor_path = selected_path
         self.selected_paths = (selected_path,)
         self.preview_source_path = selected_path
+        self.image_settings_by_path = {selected_path: self._current_settings()}
         self.source_name_var.set(str(selected_path))
         self.image_count_var.set("เลือกรูปเดี่ยว 1 ไฟล์")
+        self.gallery_status_var.set("โหมดรูปเดี่ยว ไม่แสดง gallery หลายรูป")
+        self._apply_settings_to_controls(
+            self.image_settings_by_path[selected_path]
+        )
+        self._refresh_gallery()
         self._set_status("เลือกไฟล์รูปภาพเรียบร้อยแล้ว")
         self._render_previews()
 
@@ -649,14 +688,24 @@ class AutoWatermarkWindow(ctk.CTk):
         if not selection:
             return
 
+        self._persist_current_preview_settings()
         self._clear_result_preview_state()
         source_folder = Path(selection)
         images = tuple(discover_images(source_folder))
         self.selection_anchor_path = source_folder
         self.selected_paths = images
         self.preview_source_path = images[0] if images else None
+        base_settings = self._current_settings()
+        self.image_settings_by_path = {
+            image_path: base_settings for image_path in images
+        }
         self.source_name_var.set(str(source_folder))
         self.image_count_var.set(f"พบรูปภาพ {len(images)} ไฟล์")
+        if self.preview_source_path is not None:
+            self._apply_settings_to_controls(
+                self.image_settings_by_path[self.preview_source_path]
+            )
+        self._refresh_gallery()
         self._set_status("เลือกโฟลเดอร์เรียบร้อยแล้ว")
         self._render_previews()
 
@@ -671,6 +720,129 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self.source_picker_button.configure(command=picker_command)
 
+    def _settings_for_preview_path(self) -> PlacementSettings:
+        if self.preview_source_path is None:
+            return self._current_settings()
+        return self.image_settings_by_path.get(
+            self.preview_source_path,
+            self._current_settings(),
+        )
+
+    def _persist_current_preview_settings(self) -> None:
+        if self.preview_source_path is None:
+            return
+        if self.preview_source_path not in self.selected_paths:
+            return
+        self.image_settings_by_path[self.preview_source_path] = (
+            self._current_settings()
+        )
+
+    def _apply_settings_to_controls(
+        self,
+        settings: PlacementSettings,
+    ) -> None:
+        self.landscape_position_var.set(settings.landscape_position)
+        self.portrait_position_var.set(settings.portrait_position)
+        self.output_size_var.set(settings.output_size_mode)
+        self._set_output_size_note(settings.output_size_mode)
+        self._set_offset_values(settings.offset_x, settings.offset_y)
+        self._set_logo_scale_value(settings.logo_scale_percent)
+
+    def _set_output_size_note(self, mode: str) -> None:
+        if mode == OUTPUT_SIZE_ORIGINAL:
+            self.output_size_note_var.set("ผลลัพธ์จะคงขนาดต้นฉบับไว้")
+        else:
+            self.output_size_note_var.set(
+                "ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
+            )
+
+    def _select_gallery_image(self, image_path: Path) -> None:
+        if image_path == self.preview_source_path:
+            return
+        self._persist_current_preview_settings()
+        self.preview_source_path = image_path
+        self._clear_result_preview_state()
+        self._apply_settings_to_controls(
+            self.image_settings_by_path.get(
+                image_path,
+                self._current_settings(),
+            )
+        )
+        self.gallery_status_var.set(f"กำลังแก้: {image_path.name}")
+        self._refresh_gallery_selection()
+        self._render_previews()
+
+    def _refresh_gallery(self) -> None:
+        for child in self.gallery_frame.winfo_children():
+            child.destroy()
+
+        self._gallery_buttons = {}
+        self._gallery_thumbnail_images = {}
+
+        if (
+            self.selection_mode_var.get() != "folder"
+            or not self.selected_paths
+        ):
+            self.gallery_status_var.set("Gallery จะแสดงเมื่อเลือกโฟลเดอร์")
+            ctk.CTkLabel(
+                self.gallery_frame,
+                text="ยังไม่มีรายการรูปในโหมดโฟลเดอร์",
+                text_color=("#6a7280", "#c4cad4"),
+            ).grid(row=0, column=0, padx=8, pady=10, sticky="w")
+            return
+
+        current_name = (
+            self.preview_source_path.name
+            if self.preview_source_path is not None
+            else self.selected_paths[0].name
+        )
+        self.gallery_status_var.set(
+            f"เลือกดูและตั้งค่าแยกรูปได้ ตอนนี้: {current_name}"
+        )
+
+        for index, image_path in enumerate(self.selected_paths):
+            thumbnail = self._load_thumbnail_from_path(
+                image_path,
+                target_size=GALLERY_THUMBNAIL_SIZE,
+            )
+            ctk_image = None
+            if thumbnail is not None:
+                ctk_image = ctk.CTkImage(
+                    light_image=thumbnail,
+                    dark_image=thumbnail,
+                    size=thumbnail.size,
+                )
+                self._gallery_thumbnail_images[image_path] = ctk_image
+
+            button = ctk.CTkButton(
+                self.gallery_frame,
+                text=image_path.name,
+                image=ctk_image,
+                compound="left",
+                anchor="w",
+                height=76,
+                command=lambda path=image_path: self._select_gallery_image(
+                    path
+                ),
+            )
+            button.grid(
+                row=index,
+                column=0,
+                padx=6,
+                pady=4,
+                sticky="ew",
+            )
+            self._gallery_buttons[image_path] = button
+
+        self._refresh_gallery_selection()
+
+    def _refresh_gallery_selection(self) -> None:
+        for image_path, button in self._gallery_buttons.items():
+            if image_path == self.preview_source_path:
+                button.configure(fg_color=("#1f6aa5", "#1f6aa5"))
+            else:
+                button.configure(fg_color=("#3a3a3a", "#2b2b2b"))
+
     def _current_settings(self) -> PlacementSettings:
         return PlacementSettings(
             landscape_position=self.landscape_position_var.get(),
@@ -682,6 +854,7 @@ class AutoWatermarkWindow(ctk.CTk):
         )
 
     def _build_request(self) -> BatchRequest | None:
+        self._persist_current_preview_settings()
         if self.logo_path is None:
             return None
         if not self.selected_paths:
@@ -694,6 +867,7 @@ class AutoWatermarkWindow(ctk.CTk):
             source_folder=anchor_path if anchor_path.is_dir() else None,
             source_paths=self.selected_paths,
             output_folder=get_output_folder(anchor_path),
+            settings_by_path=dict(self.image_settings_by_path),
         )
 
     def _start_processing(self) -> None:
@@ -797,6 +971,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self.status_var.set(message)
 
     def _render_previews(self) -> None:
+        self._persist_current_preview_settings()
         self._set_preview_image(
             self.logo_preview_label,
             self._load_logo_preview(),
@@ -809,6 +984,7 @@ class AutoWatermarkWindow(ctk.CTk):
             "_source_preview_image",
             "ยังไม่มีรูปต้นฉบับ",
         )
+        self._refresh_gallery_selection()
         self._render_result_preview()
 
     def _load_logo_preview(self) -> Image.Image | None:
@@ -838,7 +1014,7 @@ class AutoWatermarkWindow(ctk.CTk):
                     return build_watermark_scene(
                         source_image,
                         logo_image,
-                        self._current_settings(),
+                        self._settings_for_preview_path(),
                         preview=True,
                     )
         except OSError:
@@ -896,8 +1072,8 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self._result_preview_logo_bbox = bbox
         self._result_preview_anchor_position = (
-            scene.position[0] - self._current_settings().offset_x,
-            scene.position[1] - self._current_settings().offset_y,
+            scene.position[0] - self._settings_for_preview_path().offset_x,
+            scene.position[1] - self._settings_for_preview_path().offset_y,
         )
         canvas.create_rectangle(
             bbox[0],

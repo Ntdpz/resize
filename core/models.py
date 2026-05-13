@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -41,6 +41,9 @@ class BatchRequest:
     source_folder: Path | None = None
     source_paths: tuple[Path, ...] = ()
     output_folder: Path | None = None
+    settings_by_path: dict[Path, PlacementSettings] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)

@@ -67,18 +67,22 @@ def process_batch(
 
     with Image.open(request.logo_path) as logo_image:
         for index, image_path in enumerate(image_paths, start=1):
+            image_settings = request.settings_by_path.get(
+                image_path,
+                request.settings,
+            )
             with Image.open(image_path) as source_image:
                 result_image = apply_watermark(
                     source_image,
                     logo_image,
-                    request.settings,
+                    image_settings,
                 )
 
             output_path = output_folder / image_path.name
             save_processed_image(
                 result_image,
                 output_path,
-                request.settings.quality,
+                image_settings.quality,
             )
             processed_files.append(
                 ProcessedFile(
