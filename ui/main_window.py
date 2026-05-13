@@ -79,6 +79,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self.offset_y_value_var = ctk.StringVar(value="0 px")
 
         self._build_layout()
+        self._init_source_picker_command()
         self._render_previews()
         self.after(120, self._poll_events)
 
@@ -202,7 +203,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self.source_picker_button = ctk.CTkButton(
             source_card,
             text="เลือกโฟลเดอร์รูปภาพ",
-            command=self._choose_source,
+            command=self._choose_folder,
         )
         self.source_picker_button.grid(
             row=4,
@@ -583,7 +584,6 @@ class AutoWatermarkWindow(ctk.CTk):
         self.selection_mode_var.set(mode)
         self.selection_anchor_path = None
         self.selected_paths = ()
-        self.preview_source_path = None
         self.source_name_var.set("ยังไม่ได้เลือกรูปหรือโฟลเดอร์")
         self.image_count_var.set(
             "โหมดโฟลเดอร์" if mode == "folder" else "โหมดรูปเดี่ยว"
@@ -594,6 +594,7 @@ class AutoWatermarkWindow(ctk.CTk):
             else "เลือกไฟล์รูปภาพ"
         )
         self.source_picker_button.configure(text=button_text)
+        self._update_source_picker_command()
         self._set_status("สลับโหมดเลือกต้นฉบับแล้ว")
         self._render_previews()
 
@@ -622,12 +623,6 @@ class AutoWatermarkWindow(ctk.CTk):
         self._set_status("เลือกโลโก้เรียบร้อยแล้ว")
         self._render_previews()
 
-    def _choose_source(self) -> None:
-        if self.selection_mode_var.get() == "single":
-            self._choose_single_image()
-            return
-        self._choose_folder()
-
     def _choose_single_image(self) -> None:
         selection = filedialog.askopenfilename(
             title="เลือกไฟล์รูปภาพ",
@@ -639,6 +634,7 @@ class AutoWatermarkWindow(ctk.CTk):
         if not selection:
             return
 
+        self._clear_result_preview_state()
         selected_path = Path(selection)
         self.selection_anchor_path = selected_path
         self.selected_paths = (selected_path,)
@@ -653,6 +649,7 @@ class AutoWatermarkWindow(ctk.CTk):
         if not selection:
             return
 
+        self._clear_result_preview_state()
         source_folder = Path(selection)
         images = tuple(discover_images(source_folder))
         self.selection_anchor_path = source_folder
@@ -662,6 +659,17 @@ class AutoWatermarkWindow(ctk.CTk):
         self.image_count_var.set(f"พบรูปภาพ {len(images)} ไฟล์")
         self._set_status("เลือกโฟลเดอร์เรียบร้อยแล้ว")
         self._render_previews()
+
+    def _init_source_picker_command(self) -> None:
+        self._update_source_picker_command()
+
+    def _update_source_picker_command(self) -> None:
+        picker_command = (
+            self._choose_single_image
+            if self.selection_mode_var.get() == "single"
+            else self._choose_folder
+        )
+        self.source_picker_button.configure(command=picker_command)
 
     def _current_settings(self) -> PlacementSettings:
         return PlacementSettings(
@@ -842,10 +850,10 @@ class AutoWatermarkWindow(ctk.CTk):
 
         scene = self._load_result_scene()
         if scene is None:
+            self._clear_result_preview_state()
             self._result_preview_base_image = None
             self._result_preview_logo_image = None
             self._result_preview_logo_bbox = None
-            self._result_preview_anchor_position = None
             canvas.create_text(
                 RESULT_CANVAS_SIZE[0] / 2,
                 RESULT_CANVAS_SIZE[1] / 2,
@@ -1021,6 +1029,12 @@ class AutoWatermarkWindow(ctk.CTk):
         self.logo_scale_var.set(clamped_value)
         self.scale_value_var.set(f"{clamped_value}%")
 
+    def _clear_result_preview_state(self) -> None:
+        self._result_preview_logo_bbox = None
+        self._result_preview_anchor_position = None
+        self._result_preview_drag_origin = None
+        self._result_preview_drag_position = None
+
     def _set_preview_image(
         self,
         widget: ctk.CTkLabel,
@@ -1028,9 +1042,10 @@ class AutoWatermarkWindow(ctk.CTk):
         cache_attr: str,
         placeholder: str,
     ) -> None:
+        previous_image = getattr(self, cache_attr, None)
         if image is None:
-            setattr(self, cache_attr, None)
             widget.configure(image=None, text=placeholder)
+            setattr(self, cache_attr, None)
             return
 
         ctk_image = ctk.CTkImage(
@@ -1038,8 +1053,9 @@ class AutoWatermarkWindow(ctk.CTk):
             dark_image=image,
             size=image.size,
         )
-        setattr(self, cache_attr, ctk_image)
         widget.configure(image=ctk_image, text="")
+        setattr(self, cache_attr, ctk_image)
+        _ = previous_image
 
     def _open_output_folder(self) -> None:
         if (
