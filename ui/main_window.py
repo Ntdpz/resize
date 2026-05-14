@@ -30,6 +30,9 @@ LOGO_PREVIEW_SIZE = (180, 180)
 SOURCE_PREVIEW_SIZE = (220, 220)
 RESULT_CANVAS_SIZE = (360, 520)
 GALLERY_THUMBNAIL_SIZE = (72, 72)
+PREVIEW_RENDER_DELAY_MS = 45
+GALLERY_RENDER_BATCH_SIZE = 12
+GALLERY_RENDER_DELAY_MS = 12
 
 
 class AutoWatermarkWindow(ctk.CTk):
@@ -48,6 +51,10 @@ class AutoWatermarkWindow(ctk.CTk):
 
         self._worker: threading.Thread | None = None
         self._events: queue.Queue[AppEvent] = queue.Queue()
+        self._preview_render_after_id: str | None = None
+        self._gallery_render_after_id: str | None = None
+        self._gallery_render_paths: tuple[Path, ...] = ()
+        self._gallery_render_index = 0
 
         self._logo_preview_image: ctk.CTkImage | None = None
         self._source_preview_image: ctk.CTkImage | None = None
@@ -59,8 +66,13 @@ class AutoWatermarkWindow(ctk.CTk):
         self._result_preview_drag_position: tuple[int, int] | None = None
         self._gallery_thumbnail_images: dict[Path, ctk.CTkImage] = {}
         self._gallery_buttons: dict[Path, ctk.CTkButton] = {}
+        self._thumbnail_cache: dict[
+            tuple[Path, bool, tuple[int, int]], tuple[int, Image.Image]
+        ] = {}
+        self._scene_image_cache: dict[Path, tuple[int, Image.Image]] = {}
 
         self.selection_mode_var = ctk.StringVar(value="folder")
+        self.workflow_mode_var = ctk.StringVar(value="quick")
         self.output_size_var = ctk.StringVar(value=OUTPUT_SIZE_RESIZE_1280)
         self.landscape_position_var = ctk.StringVar(value="bottom-right")
         self.portrait_position_var = ctk.StringVar(value="top-right")
@@ -76,7 +88,10 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self.image_count_var = ctk.StringVar(value="โหมดโฟลเดอร์")
         self.gallery_status_var = ctk.StringVar(
-            value="Gallery จะแสดงเมื่อเลือกโฟลเดอร์"
+            value="Quick mode พร้อมสำหรับงานเร็ว"
+        )
+        self.workflow_note_var = ctk.StringVar(
+            value="Quick: หน้าจอเรียบ ใช้ Result preview เป็นหลัก"
         )
         self.output_size_note_var = ctk.StringVar(
             value="ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
@@ -87,6 +102,8 @@ class AutoWatermarkWindow(ctk.CTk):
 
         self._build_layout()
         self._init_source_picker_command()
+        self._update_gallery_visibility()
+        self._update_preview_layout_visibility()
         self._render_previews()
         self.after(120, self._poll_events)
 
@@ -220,21 +237,57 @@ class AutoWatermarkWindow(ctk.CTk):
             sticky="ew",
         )
 
+        self.workflow_mode_button = ctk.CTkSegmentedButton(
+            source_card,
+            values=["quick", "review"],
+            variable=self.workflow_mode_var,
+            command=self._on_workflow_mode_changed,
+        )
+        self.workflow_mode_button.grid(
+            row=5,
+            column=0,
+            padx=18,
+            pady=(0, 12),
+            sticky="ew",
+        )
+        self.workflow_mode_button.set("quick")
         ctk.CTkLabel(
+            source_card,
+            textvariable=self.workflow_note_var,
+            wraplength=340,
+            justify="left",
+            text_color=("#5b6472", "#b0b8c4"),
+        ).grid(row=6, column=0, padx=18, pady=(0, 10), sticky="w")
+
+        self.gallery_title_label = ctk.CTkLabel(
             source_card,
             text="Gallery / รายการรูป",
             font=ctk.CTkFont(size=15, weight="bold"),
-        ).grid(row=5, column=0, padx=18, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(
+        )
+        self.gallery_title_label.grid(
+            row=7,
+            column=0,
+            padx=18,
+            pady=(0, 6),
+            sticky="w",
+        )
+        self.gallery_status_label = ctk.CTkLabel(
             source_card,
             textvariable=self.gallery_status_var,
             wraplength=340,
             justify="left",
             text_color=("#5b6472", "#b0b8c4"),
-        ).grid(row=6, column=0, padx=18, pady=(0, 8), sticky="w")
+        )
+        self.gallery_status_label.grid(
+            row=8,
+            column=0,
+            padx=18,
+            pady=(0, 8),
+            sticky="w",
+        )
         self.gallery_frame = ctk.CTkScrollableFrame(source_card, height=220)
         self.gallery_frame.grid(
-            row=7,
+            row=9,
             column=0,
             padx=18,
             pady=(0, 18),
@@ -409,11 +462,12 @@ class AutoWatermarkWindow(ctk.CTk):
         self.open_output_button.grid(row=0, column=1, padx=(8, 0), sticky="ew")
 
     def _build_preview_section(self, parent: ctk.CTkFrame) -> None:
-        ctk.CTkLabel(
+        self.preview_title_label = ctk.CTkLabel(
             parent,
             text="Preview",
             font=ctk.CTkFont(size=22, weight="bold"),
-        ).grid(
+        )
+        self.preview_title_label.grid(
             row=0,
             column=0,
             columnspan=3,
@@ -572,7 +626,7 @@ class AutoWatermarkWindow(ctk.CTk):
             parent,
             variable=variable,
             values=values,
-            command=lambda _value: self._render_previews(),
+            command=lambda _value: self._schedule_preview_render(),
         ).grid(row=row, column=1, padx=(0, 18), pady=10, sticky="ew")
 
     def _add_slider(
@@ -592,7 +646,7 @@ class AutoWatermarkWindow(ctk.CTk):
 
         def on_change(value: float) -> None:
             display_var.set(f"{round(value)}{suffix}")
-            self._render_previews()
+            self._schedule_preview_render()
 
         ctk.CTkLabel(frame, text=label).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(frame, textvariable=display_var).grid(
@@ -628,7 +682,22 @@ class AutoWatermarkWindow(ctk.CTk):
         self._update_source_picker_command()
         self._refresh_gallery()
         self._set_status("สลับโหมดเลือกต้นฉบับแล้ว")
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
+
+    def _on_workflow_mode_changed(self, mode: str) -> None:
+        self.workflow_mode_var.set(mode)
+        self._set_workflow_copy(mode)
+        self._update_gallery_visibility()
+        self._update_preview_layout_visibility()
+        if mode == "quick":
+            self.gallery_status_var.set(
+                "Quick mode ซ่อนรายการรูปเพื่อให้ทำงานเร็วขึ้น"
+            )
+            self._set_status("สลับเป็น Quick Batch แล้ว")
+        else:
+            self._set_status("สลับเป็น Gallery Review แล้ว")
+        self._refresh_gallery()
+        self._schedule_preview_render(delay_ms=0)
 
     def _on_output_size_changed(self, mode: str) -> None:
         self.output_size_var.set(mode)
@@ -640,7 +709,7 @@ class AutoWatermarkWindow(ctk.CTk):
                 "ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
             )
             self._set_status("เปลี่ยนเป็นโหมด Resize 1280px แล้ว")
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _choose_logo(self) -> None:
         selection = filedialog.askopenfilename(
@@ -652,8 +721,9 @@ class AutoWatermarkWindow(ctk.CTk):
 
         self.logo_path = Path(selection)
         self.logo_name_var.set(self.logo_path.name)
+        self._invalidate_image_cache(self.logo_path)
         self._set_status("เลือกโลโก้เรียบร้อยแล้ว")
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _choose_single_image(self) -> None:
         selection = filedialog.askopenfilename(
@@ -681,7 +751,7 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self._refresh_gallery()
         self._set_status("เลือกไฟล์รูปภาพเรียบร้อยแล้ว")
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _choose_folder(self) -> None:
         selection = filedialog.askdirectory(title="เลือกโฟลเดอร์รูปภาพ")
@@ -707,7 +777,7 @@ class AutoWatermarkWindow(ctk.CTk):
             )
         self._refresh_gallery()
         self._set_status("เลือกโฟลเดอร์เรียบร้อยแล้ว")
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _init_source_picker_command(self) -> None:
         self._update_source_picker_command()
@@ -770,9 +840,10 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         self.gallery_status_var.set(f"กำลังแก้: {image_path.name}")
         self._refresh_gallery_selection()
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _refresh_gallery(self) -> None:
+        self._cancel_gallery_render()
         for child in self.gallery_frame.winfo_children():
             child.destroy()
 
@@ -791,6 +862,17 @@ class AutoWatermarkWindow(ctk.CTk):
             ).grid(row=0, column=0, padx=8, pady=10, sticky="w")
             return
 
+        if self.workflow_mode_var.get() != "review":
+            self.gallery_status_var.set(
+                "Quick mode ซ่อน gallery เพื่อให้หน้าจอเรียบและลื่น"
+            )
+            ctk.CTkLabel(
+                self.gallery_frame,
+                text="สลับเป็น Review เพื่อดูและแก้ทีละรูป",
+                text_color=("#6a7280", "#c4cad4"),
+            ).grid(row=0, column=0, padx=8, pady=10, sticky="w")
+            return
+
         current_name = (
             self.preview_source_path.name
             if self.preview_source_path is not None
@@ -800,41 +882,83 @@ class AutoWatermarkWindow(ctk.CTk):
             f"เลือกดูและตั้งค่าแยกรูปได้ ตอนนี้: {current_name}"
         )
 
-        for index, image_path in enumerate(self.selected_paths):
-            thumbnail = self._load_thumbnail_from_path(
-                image_path,
-                target_size=GALLERY_THUMBNAIL_SIZE,
-            )
-            ctk_image = None
-            if thumbnail is not None:
-                ctk_image = ctk.CTkImage(
-                    light_image=thumbnail,
-                    dark_image=thumbnail,
-                    size=thumbnail.size,
-                )
-                self._gallery_thumbnail_images[image_path] = ctk_image
+        self._gallery_render_paths = self.selected_paths
+        self._gallery_render_index = 0
+        self._render_gallery_batch()
 
-            button = ctk.CTkButton(
-                self.gallery_frame,
-                text=image_path.name,
-                image=ctk_image,
-                compound="left",
-                anchor="w",
-                height=76,
-                command=lambda path=image_path: self._select_gallery_image(
-                    path
-                ),
-            )
-            button.grid(
-                row=index,
-                column=0,
-                padx=6,
-                pady=4,
-                sticky="ew",
-            )
-            self._gallery_buttons[image_path] = button
+    def _cancel_gallery_render(self) -> None:
+        if self._gallery_render_after_id is not None:
+            self.after_cancel(self._gallery_render_after_id)
+            self._gallery_render_after_id = None
+        self._gallery_render_paths = ()
+        self._gallery_render_index = 0
 
+    def _render_gallery_batch(self) -> None:
+        self._gallery_render_after_id = None
+        if not self._gallery_render_paths:
+            return
+
+        start_index = self._gallery_render_index
+        end_index = min(
+            start_index + GALLERY_RENDER_BATCH_SIZE,
+            len(self._gallery_render_paths),
+        )
+        for index in range(start_index, end_index):
+            self._append_gallery_item(index, self._gallery_render_paths[index])
+
+        self._gallery_render_index = end_index
         self._refresh_gallery_selection()
+
+        current_name = (
+            self.preview_source_path.name
+            if self.preview_source_path is not None
+            else self._gallery_render_paths[0].name
+        )
+        self.gallery_status_var.set(
+            f"เลือกดูและตั้งค่าแยกรูปได้ ตอนนี้: {current_name} "
+            f"({end_index}/{len(self._gallery_render_paths)})"
+        )
+
+        if end_index < len(self._gallery_render_paths):
+            self._gallery_render_after_id = self.after(
+                GALLERY_RENDER_DELAY_MS,
+                self._render_gallery_batch,
+            )
+            return
+
+        self._gallery_render_paths = ()
+
+    def _append_gallery_item(self, index: int, image_path: Path) -> None:
+        thumbnail = self._load_thumbnail_from_path(
+            image_path,
+            target_size=GALLERY_THUMBNAIL_SIZE,
+        )
+        ctk_image = None
+        if thumbnail is not None:
+            ctk_image = ctk.CTkImage(
+                light_image=thumbnail,
+                dark_image=thumbnail,
+                size=thumbnail.size,
+            )
+            self._gallery_thumbnail_images[image_path] = ctk_image
+
+        button = ctk.CTkButton(
+            self.gallery_frame,
+            text=image_path.name,
+            image=ctk_image,
+            compound="left",
+            anchor="w",
+            height=76,
+            command=lambda path=image_path: self._select_gallery_image(path),
+        )
+        button.grid(
+            row=index,
+            column=0,
+            padx=6,
+            pady=4,
+            sticky="ew",
+        )
+        self._gallery_buttons[image_path] = button
 
     def _refresh_gallery_selection(self) -> None:
         for image_path, button in self._gallery_buttons.items():
@@ -842,6 +966,50 @@ class AutoWatermarkWindow(ctk.CTk):
                 button.configure(fg_color=("#1f6aa5", "#1f6aa5"))
             else:
                 button.configure(fg_color=("#3a3a3a", "#2b2b2b"))
+
+    def _update_gallery_visibility(self) -> None:
+        show_gallery = (
+            self.selection_mode_var.get() == "folder"
+            and self.workflow_mode_var.get() == "review"
+        )
+        widgets = (
+            self.gallery_title_label,
+            self.gallery_status_label,
+            self.gallery_frame,
+        )
+        for widget in widgets:
+            if show_gallery:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _update_preview_layout_visibility(self) -> None:
+        compact_preview = self.workflow_mode_var.get() == "quick"
+        logo_frame = cast(ctk.CTkFrame, self.logo_preview_label.master)
+        source_frame = cast(ctk.CTkFrame, self.source_preview_label.master)
+        result_frame = cast(ctk.CTkFrame, self.result_preview_canvas.master)
+
+        if compact_preview:
+            logo_frame.grid_remove()
+            source_frame.grid_remove()
+            result_frame.grid_configure(column=0, columnspan=3)
+            self.preview_title_label.configure(text="Quick Preview")
+            return
+
+        logo_frame.grid()
+        source_frame.grid()
+        result_frame.grid_configure(column=2, columnspan=1)
+        self.preview_title_label.configure(text="Preview")
+
+    def _set_workflow_copy(self, mode: str) -> None:
+        if mode == "quick":
+            self.workflow_note_var.set(
+                "Quick: หน้าจอเรียบ ใช้ Result preview เป็นหลัก"
+            )
+        else:
+            self.workflow_note_var.set(
+                "Review: เปิด gallery เพื่อแก้แยกรูปทีละใบ"
+            )
 
     def _current_settings(self) -> PlacementSettings:
         return PlacementSettings(
@@ -959,7 +1127,7 @@ class AutoWatermarkWindow(ctk.CTk):
             "ผลลัพธ์ถูกบันทึกไว้ที่:\n"
             f"{self.last_output_folder}",
         )
-        self._render_previews()
+        self._schedule_preview_render(delay_ms=0)
 
     def _handle_error(self, message: str) -> None:
         self.start_button.configure(state="normal")
@@ -970,20 +1138,52 @@ class AutoWatermarkWindow(ctk.CTk):
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
 
+    def _schedule_preview_render(
+        self,
+        delay_ms: int = PREVIEW_RENDER_DELAY_MS,
+    ) -> None:
+        if self._preview_render_after_id is not None:
+            self.after_cancel(self._preview_render_after_id)
+            self._preview_render_after_id = None
+
+        if delay_ms <= 0:
+            self._render_previews()
+            return
+
+        self._preview_render_after_id = self.after(
+            delay_ms,
+            self._render_previews,
+        )
+
     def _render_previews(self) -> None:
+        self._preview_render_after_id = None
         self._persist_current_preview_settings()
-        self._set_preview_image(
-            self.logo_preview_label,
-            self._load_logo_preview(),
-            "_logo_preview_image",
-            "ยังไม่มีโลโก้",
-        )
-        self._set_preview_image(
-            self.source_preview_label,
-            self._load_source_preview(),
-            "_source_preview_image",
-            "ยังไม่มีรูปต้นฉบับ",
-        )
+        if self.workflow_mode_var.get() == "review":
+            self._set_preview_image(
+                self.logo_preview_label,
+                self._load_logo_preview(),
+                "_logo_preview_image",
+                "ยังไม่มีโลโก้",
+            )
+            self._set_preview_image(
+                self.source_preview_label,
+                self._load_source_preview(),
+                "_source_preview_image",
+                "ยังไม่มีรูปต้นฉบับ",
+            )
+        else:
+            self._set_preview_image(
+                self.logo_preview_label,
+                None,
+                "_logo_preview_image",
+                "ยังไม่มีโลโก้",
+            )
+            self._set_preview_image(
+                self.source_preview_label,
+                None,
+                "_source_preview_image",
+                "ยังไม่มีรูปต้นฉบับ",
+            )
         self._refresh_gallery_selection()
         self._render_result_preview()
 
@@ -1009,14 +1209,16 @@ class AutoWatermarkWindow(ctk.CTk):
             return None
 
         try:
-            with Image.open(self.preview_source_path) as source_image:
-                with Image.open(self.logo_path) as logo_image:
-                    return build_watermark_scene(
-                        source_image,
-                        logo_image,
-                        self._settings_for_preview_path(),
-                        preview=True,
-                    )
+            source_image = self._get_cached_scene_image(
+                self.preview_source_path,
+            )
+            logo_image = self._get_cached_scene_image(self.logo_path)
+            return build_watermark_scene(
+                source_image,
+                logo_image,
+                self._settings_for_preview_path(),
+                preview=True,
+            )
         except OSError:
             return None
 
@@ -1151,7 +1353,7 @@ class AutoWatermarkWindow(ctk.CTk):
             min(desired_y - anchor_y, max_offset_y),
         )
         self._set_offset_values(round(offset_x), round(offset_y))
-        self._render_previews()
+        self._schedule_preview_render()
 
     def _on_result_preview_release(self, _event: tk.Event) -> None:
         self._result_preview_drag_origin = None
@@ -1164,7 +1366,58 @@ class AutoWatermarkWindow(ctk.CTk):
         current_value = self.logo_scale_var.get()
         step = 1 if event.delta > 0 else -1
         self._set_logo_scale_value(current_value + step)
-        self._render_previews()
+        self._schedule_preview_render()
+
+    def _get_cached_thumbnail(
+        self,
+        image_path: Path,
+        keep_alpha: bool,
+        target_size: tuple[int, int],
+    ) -> Image.Image | None:
+        try:
+            cache_key = (image_path, keep_alpha, target_size)
+            mtime_ns = image_path.stat().st_mtime_ns
+            cached_entry = self._thumbnail_cache.get(cache_key)
+            if cached_entry is not None and cached_entry[0] == mtime_ns:
+                return cached_entry[1].copy()
+
+            with Image.open(image_path) as image:
+                preview_image = image.copy()
+        except OSError:
+            return None
+
+        if keep_alpha:
+            preview_image = create_preview_base(preview_image)
+
+        thumbnail = self._thumbnail_image(
+            preview_image,
+            target_size=target_size,
+        )
+        self._thumbnail_cache[cache_key] = (mtime_ns, thumbnail.copy())
+        return thumbnail
+
+    def _get_cached_scene_image(self, image_path: Path) -> Image.Image:
+        mtime_ns = image_path.stat().st_mtime_ns
+        cached_entry = self._scene_image_cache.get(image_path)
+        if cached_entry is not None and cached_entry[0] == mtime_ns:
+            return cached_entry[1].copy()
+
+        with Image.open(image_path) as image:
+            scene_image = image.copy()
+
+        self._scene_image_cache[image_path] = (mtime_ns, scene_image.copy())
+        return scene_image
+
+    def _invalidate_image_cache(self, image_path: Path | None) -> None:
+        if image_path is None:
+            return
+
+        self._scene_image_cache.pop(image_path, None)
+        thumbnail_keys = [
+            key for key in self._thumbnail_cache if key[0] == image_path
+        ]
+        for key in thumbnail_keys:
+            self._thumbnail_cache.pop(key, None)
 
     def _load_thumbnail_from_path(
         self,
@@ -1172,18 +1425,11 @@ class AutoWatermarkWindow(ctk.CTk):
         keep_alpha: bool = False,
         target_size: tuple[int, int] = PREVIEW_IMAGE_SIZE,
     ) -> Image.Image | None:
-        try:
-            with Image.open(image_path) as image:
-                preview_image = image.copy()
-        except OSError:
-            return None
-
-        if keep_alpha:
-            return self._thumbnail_image(
-                create_preview_base(preview_image),
-                target_size=target_size,
-            )
-        return self._thumbnail_image(preview_image, target_size=target_size)
+        return self._get_cached_thumbnail(
+            image_path,
+            keep_alpha=keep_alpha,
+            target_size=target_size,
+        )
 
     def _thumbnail_image(
         self,

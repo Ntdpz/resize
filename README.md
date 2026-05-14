@@ -12,7 +12,10 @@ Windows desktop app for batch watermarking images with selectable output size mo
 - Apply different default watermark positions for landscape and portrait images.
 - Adjust watermark size plus horizontal and vertical offsets from the UI.
 - Preview the logo, the selected source image, and the final output before processing.
+- Start in `Quick` mode with a minimal UI focused on the final `Result` preview.
+- Switch to `Review` mode when you need the full `Logo` and `Source` previews plus gallery editing.
 - In `folder` mode, review images in a built-in gallery and switch between them before exporting.
+- In `Review` mode, gallery thumbnails load progressively so large folders stay responsive on low-spec machines.
 - Save different logo position, size, and output-mode settings for each image in the selected folder.
 - Drag the logo directly on the `Result` preview to change position.
 - Use the mouse wheel over the logo on the `Result` preview to resize it.
@@ -42,14 +45,13 @@ The executable file is `dist\AutoWatermark.exe`.
 2. Click `เลือกไฟล์โลโก้ .png` and choose the company logo.
 3. Choose `folder` or `single` mode.
 4. Click the source picker and choose an image folder or one image file.
-5. In `folder` mode, use the gallery list to pick the image you want to edit.
-6. Review the `Logo`, `Source`, and `Result` preview panes.
-7. Choose `Resize 1280px` or `Original Size` in the `Output Size` control.
-8. Drag the logo on the `Result` preview or use the controls to adjust position for the current image.
-9. Use the mouse wheel over the logo in the `Result` preview or the size slider to resize it.
-10. Repeat for other gallery items if you want different settings per image.
-11. Click `START / เริ่มประมวลผล`.
-12. When finished, click `เปิดโฟลเดอร์ผลลัพธ์`.
+5. Leave the app in `Quick` mode for the fastest workflow, or switch to `Review` if you want to inspect more previews and use the gallery.
+6. Choose `Resize 1280px` or `Original Size` in the `Output Size` control.
+7. Drag the logo on the `Result` preview or use the controls to adjust position for the current image.
+8. Use the mouse wheel over the logo in the `Result` preview or the size slider to resize it.
+9. In `Review` + `folder` mode, use the gallery list to pick the image you want to edit and save different settings per file.
+10. Click `START / เริ่มประมวลผล`.
+11. When finished, click `เปิดโฟลเดอร์ผลลัพธ์`.
 
 ## Project Structure
 
