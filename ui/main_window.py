@@ -78,7 +78,9 @@ class AutoWatermarkWindow(ctk.CTk):
         self._canvas_handle_id: int | None = None   # resize handle circle
         self._canvas_selection_id: int | None = None  # dashed border
         # Ratio (0.0–1.0) of full-res image; None = use preset
-        self._logo_pos_ratio: tuple[float, float] | None = None
+        # Now per-image: path → (ratio_x, ratio_y)
+        self._logo_pos_ratio: tuple[float, float] | None = None  # current image
+        self._per_image_pos_ratios: dict[Path, tuple[float, float]] = {}  # all images
         self._drag_start_evt: tuple[int, int] | None = None
         self._drag_start_logo_canvas: tuple[float, float] | None = None
         self._prev_scale: float = 1.0
@@ -94,10 +96,19 @@ class AutoWatermarkWindow(ctk.CTk):
         # ── UI variables ───────────────────────────────────────────────
         self.position_thai_var = ctk.StringVar(value=POSITION_THAI["top-right"])
         self.output_size_var = ctk.StringVar(value=OUTPUT_SIZE_RESIZE_1280)
-        self.logo_scale_var = ctk.IntVar(value=18)
+        self.logo_scale_var = ctk.IntVar(value=18)          # landscape scale
         self.scale_display_var = ctk.StringVar(value="18%")
+        self.logo_scale_portrait_var = ctk.IntVar(value=18)  # portrait scale
+        self.scale_portrait_display_var = ctk.StringVar(value="18%")
         self.progress_var = ctk.DoubleVar(value=0.0)
         self.status_var = ctk.StringVar(value="")
+
+        # ── Per-image override state ───────────────────────────────────
+        # dict[Path, PlacementSettings] — every image gets its own settings
+        self._per_image_overrides: dict[Path, PlacementSettings] = {}
+        # True global scale / position defaults used to initialize new images
+        self._global_landscape_scale: int = 18
+        self._global_portrait_scale: int = 18
 
         self._build_ui()
         self.after(100, self._poll_events)
@@ -268,28 +279,49 @@ class AutoWatermarkWindow(ctk.CTk):
         self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
         self.reset_pos_button.grid_remove()
 
-        scale_header = ctk.CTkFrame(self.settings_card, fg_color="transparent")
-        scale_header.grid(row=5, column=0, padx=14, pady=(4, 4), sticky="ew")
-        scale_header.grid_columnconfigure(0, weight=1)
+        # ── Scale: Landscape ───────────────────────────────────────────
+        scale_h_l = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        scale_h_l.grid(row=5, column=0, padx=14, pady=(4, 2), sticky="ew")
+        scale_h_l.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            scale_header, text="ขนาดโลโก้", font=ctk.CTkFont(size=12),
+            scale_h_l, text="ขนาดโลโก้  🖼 แนวนอน", font=ctk.CTkFont(size=12),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            scale_header, textvariable=self.scale_display_var,
+            scale_h_l, textvariable=self.scale_display_var,
             font=ctk.CTkFont(size=12), text_color=TEAL,
         ).grid(row=0, column=1, sticky="e")
 
         ctk.CTkSlider(
             self.settings_card,
-            from_=5, to=40,
+            from_=5, to=60,
             variable=self.logo_scale_var,
             button_color=TEAL, button_hover_color=TEAL_DARK, progress_color=TEAL,
             command=self._on_scale_changed,
-        ).grid(row=6, column=0, padx=14, pady=(0, 8), sticky="ew")
+        ).grid(row=6, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+        # ── Scale: Portrait ────────────────────────────────────────────
+        scale_h_p = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        scale_h_p.grid(row=7, column=0, padx=14, pady=(2, 2), sticky="ew")
+        scale_h_p.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            scale_h_p, text="ขนาดโลโก้  📱 แนวตั้ง", font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            scale_h_p, textvariable=self.scale_portrait_display_var,
+            font=ctk.CTkFont(size=12), text_color=TEAL,
+        ).grid(row=0, column=1, sticky="e")
+
+        ctk.CTkSlider(
+            self.settings_card,
+            from_=5, to=60,
+            variable=self.logo_scale_portrait_var,
+            button_color=TEAL, button_hover_color=TEAL_DARK, progress_color=TEAL,
+            command=self._on_scale_portrait_changed,
+        ).grid(row=8, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
             self.settings_card, text="ขนาดเอาต์พุต", font=ctk.CTkFont(size=12),
-        ).grid(row=7, column=0, padx=14, pady=(8, 4), sticky="w")
+        ).grid(row=9, column=0, padx=14, pady=(8, 4), sticky="w")
 
         ctk.CTkSegmentedButton(
             self.settings_card,
@@ -299,14 +331,40 @@ class AutoWatermarkWindow(ctk.CTk):
             selected_hover_color=TEAL_DARK,
             font=ctk.CTkFont(size=11),
             command=self._on_output_size_changed,
-        ).grid(row=8, column=0, padx=14, pady=(0, 8), sticky="ew")
+        ).grid(row=10, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
             self.settings_card,
             text="💡 ลากโลโก้บน preview · Scroll ปรับขนาด",
             font=ctk.CTkFont(size=10),
             text_color=("gray50", "gray55"),
-        ).grid(row=9, column=0, padx=14, pady=(0, 12), sticky="w")
+        ).grid(row=11, column=0, padx=14, pady=(0, 8), sticky="w")
+
+        # ── Per-image action buttons ───────────────────────────────────
+        sep = ctk.CTkFrame(self.settings_card, height=1, fg_color=("gray70", "gray35"))
+        sep.grid(row=12, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            self.settings_card,
+            text="📋  ใช้ค่านี้กับทุกรูป",
+            height=28, font=ctk.CTkFont(size=11),
+            fg_color=("gray78", "gray32"),
+            text_color=("gray10", "gray90"),
+            hover_color=("gray68", "gray42"),
+            command=self._apply_to_all,
+        ).grid(row=13, column=0, padx=14, pady=(0, 4), sticky="ew")
+
+        ctk.CTkButton(
+            self.settings_card,
+            text="🔄  รีเซ็ตทุกรูป",
+            height=28, font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            text_color=("gray40", "gray60"),
+            hover_color=("gray80", "gray28"),
+            border_width=1,
+            border_color=("gray70", "gray40"),
+            command=self._reset_all_overrides,
+        ).grid(row=14, column=0, padx=14, pady=(0, 12), sticky="ew")
 
     def _build_progress_section(self, parent: ctk.CTkFrame, row: int) -> None:
         self.progress_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -498,6 +556,10 @@ class AutoWatermarkWindow(ctk.CTk):
     def _clear_images(self) -> None:
         self.image_paths.clear()
         self._thumb_pil_cache.clear()
+        self._per_image_overrides.clear()
+        self._per_image_pos_ratios.clear()
+        self._per_image_mode = False
+        self._logo_pos_ratio = None
         self.selected_preview_path = None
         self.input_status_label.configure(text="ยังไม่ได้เลือกรูปภาพ")
         self.image_count_badge.grid_remove()
@@ -573,10 +635,36 @@ class AutoWatermarkWindow(ctk.CTk):
 
     def _on_thumb_click(self, path: Path) -> None:
         self.selected_preview_path = path
-        bg = self.filmstrip_inner.cget("bg")
-        for p, container in self._thumb_containers.items():
-            container.configure(bg=TEAL if p == path else bg)
+        self._load_settings_for_image(path)
+        self._update_filmstrip_badges()
         self._render_preview(path)
+
+    def _load_settings_for_image(self, path: Path) -> None:
+        """Load this image's settings into UI controls when switching images."""
+        override = self._per_image_overrides.get(path)
+        if override is not None:
+            self.logo_scale_var.set(override.effective_landscape_scale())
+            self.scale_display_var.set(f"{override.effective_landscape_scale()}%")
+            self.logo_scale_portrait_var.set(override.effective_portrait_scale())
+            self.scale_portrait_display_var.set(f"{override.effective_portrait_scale()}%")
+            pos_key = override.landscape_position
+            self.position_thai_var.set(
+                POSITION_THAI.get(pos_key, POSITION_THAI["top-right"]))
+            self.output_size_var.set(override.output_size_mode)
+        else:
+            self.logo_scale_var.set(self._global_landscape_scale)
+            self.scale_display_var.set(f"{self._global_landscape_scale}%")
+            self.logo_scale_portrait_var.set(self._global_portrait_scale)
+            self.scale_portrait_display_var.set(f"{self._global_portrait_scale}%")
+
+        # Sync drag-position indicator for this image
+        has_drag = path in self._per_image_pos_ratios
+        if has_drag:
+            self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
+            self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+        else:
+            self.custom_pos_label.grid_remove()
+            self.reset_pos_button.grid_remove()
 
     def _filmstrip_scroll(self, event: tk.Event) -> None:
         self.filmstrip_canvas.xview_scroll(
@@ -607,24 +695,46 @@ class AutoWatermarkWindow(ctk.CTk):
             else:
                 base = raw.copy()
             base_w, base_h = base.size
+            orientation = "landscape" if base_w > base_h else "portrait"
 
-            # Prepare logo at full resolution
-            logo_w = max(1, round(base_w * self.logo_scale_var.get() / 100))
+            # Resolve effective settings: per-image override → global
+            override = self._per_image_overrides.get(path)
+            if override is not None:
+                active_scale = (
+                    override.effective_landscape_scale()
+                    if orientation == "landscape"
+                    else override.effective_portrait_scale()
+                )
+                pos_key = (
+                    override.landscape_position
+                    if orientation == "landscape"
+                    else override.portrait_position
+                )
+            else:
+                active_scale = (
+                    self._global_landscape_scale
+                    if orientation == "landscape"
+                    else self._global_portrait_scale
+                )
+                pos_key = THAI_TO_POSITION.get(
+                    self.position_thai_var.get(), "bottom-right")
+
+            logo_w = max(1, round(base_w * active_scale / 100))
             logo_h = max(1, round(logo_w * self._logo_pil.height / self._logo_pil.width))
             logo_resized = self._logo_pil.resize(
                 (logo_w, logo_h), Image.Resampling.LANCZOS)
 
-            # Compute logo position in full-res image coords
-            if self._logo_pos_ratio is not None:
-                lx = max(0, min(
-                    round(self._logo_pos_ratio[0] * base_w), base_w - logo_w))
-                ly = max(0, min(
-                    round(self._logo_pos_ratio[1] * base_h), base_h - logo_h))
+            # Compute logo position: per-image drag ratio → preset
+            pos_ratio = self._per_image_pos_ratios.get(path)
+            if pos_ratio is not None:
+                lx = max(0, min(round(pos_ratio[0] * base_w), base_w - logo_w))
+                ly = max(0, min(round(pos_ratio[1] * base_h), base_h - logo_h))
             else:
-                pos_key = THAI_TO_POSITION.get(
-                    self.position_thai_var.get(), "bottom-right")
                 lx, ly = calculate_position(
                     base.size, (logo_w, logo_h), pos_key, 0, 0, 0)
+
+            # Keep global _logo_pos_ratio in sync for drag-state helpers
+            self._logo_pos_ratio = pos_ratio
 
             # Scale base to fit canvas
             preview_base = base.convert("RGB")
@@ -739,9 +849,18 @@ class AutoWatermarkWindow(ctk.CTk):
     def _on_logo_scroll(self, event: tk.Event) -> None:
         """Mouse wheel over logo → resize by ±1% per notch."""
         delta = 1 if event.delta > 0 else -1
-        new_val = max(5, min(40, self.logo_scale_var.get() + delta))
-        self.logo_scale_var.set(new_val)
-        self.scale_display_var.set(f"{new_val}%")
+        # Determine which scale var to adjust based on current preview image orientation
+        if (self.selected_preview_path is not None
+                and self._prev_base_size[0] <= self._prev_base_size[1]):
+            # portrait
+            new_val = max(5, min(60, self.logo_scale_portrait_var.get() + delta))
+            self.logo_scale_portrait_var.set(new_val)
+            self.scale_portrait_display_var.set(f"{new_val}%")
+        else:
+            new_val = max(5, min(60, self.logo_scale_var.get() + delta))
+            self.logo_scale_var.set(new_val)
+            self.scale_display_var.set(f"{new_val}%")
+        self._save_current_settings_if_per_image()
         self._schedule_preview()
 
     # ── Move drag ──────────────────────────────────────────────────────────────
@@ -777,15 +896,19 @@ class AutoWatermarkWindow(ctk.CTk):
         # Move logo instantly — no re-render
         self.preview_canvas.coords(self._canvas_logo_id, new_cx, new_cy)
 
-        # Store as ratio of full-res image
-        self._logo_pos_ratio = (
+        # Store as ratio of full-res image — per-image
+        ratio = (
             (new_cx - ox) / (bw * scale),
             (new_cy - oy) / (bh * scale),
         )
+        self._logo_pos_ratio = ratio
+        if self.selected_preview_path is not None:
+            self._per_image_pos_ratios[self.selected_preview_path] = ratio
 
         # Show indicator
         self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
         self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self._save_current_settings_if_per_image()
         # Keep handle in sync with new logo position
         self._update_handle_pos()
 
@@ -816,7 +939,13 @@ class AutoWatermarkWindow(ctk.CTk):
     def _on_handle_drag_start(self, event: tk.Event) -> None:
         self._resize_dragging = True
         self._resize_start_evt = (event.x, event.y)
-        self._resize_start_scale = self.logo_scale_var.get()
+        # Use orientation-specific scale as the drag baseline
+        is_portrait = self._prev_base_size[0] <= self._prev_base_size[1]
+        self._resize_start_scale = (
+            self.logo_scale_portrait_var.get()
+            if is_portrait
+            else self.logo_scale_var.get()
+        )
         self._resize_start_logo_w_canvas = self._prev_logo_size_canvas[0]
 
     def _on_handle_drag_motion(self, event: tk.Event) -> None:
@@ -828,11 +957,19 @@ class AutoWatermarkWindow(ctk.CTk):
         if self._resize_start_logo_w_canvas <= 0:
             return
         factor = (self._resize_start_logo_w_canvas + diag) / self._resize_start_logo_w_canvas
-        new_val = max(5, min(40, round(self._resize_start_scale * factor)))
-        if new_val == self.logo_scale_var.get():
-            return  # no change, skip
-        self.logo_scale_var.set(new_val)
-        self.scale_display_var.set(f"{new_val}%")
+        new_val = max(5, min(60, round(self._resize_start_scale * factor)))
+        # Apply to orientation-specific slider
+        is_portrait = self._prev_base_size[0] <= self._prev_base_size[1]
+        if is_portrait:
+            if new_val == self.logo_scale_portrait_var.get():
+                return
+            self.logo_scale_portrait_var.set(new_val)
+            self.scale_portrait_display_var.set(f"{new_val}%")
+        else:
+            if new_val == self.logo_scale_var.get():
+                return
+            self.logo_scale_var.set(new_val)
+            self.scale_display_var.set(f"{new_val}%")
 
         # ── Live resize: update canvas image directly, no full re-render ──
         if self._logo_pil is not None and self._canvas_logo_id is not None:
@@ -850,6 +987,7 @@ class AutoWatermarkWindow(ctk.CTk):
 
     def _on_handle_drag_end(self, event: tk.Event) -> None:
         self._resize_dragging = False
+        self._save_current_settings_if_per_image()
         # Full quality re-render after drag ends
         self._schedule_preview()
 
@@ -858,23 +996,105 @@ class AutoWatermarkWindow(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════════
 
     def _on_output_size_changed(self, _: str) -> None:
+        self._save_current_image_settings()
         self._schedule_preview()
 
     def _on_position_changed(self, _: str) -> None:
+        # Clear drag ratio for current image when preset is explicitly chosen
+        if self.selected_preview_path is not None:
+            self._per_image_pos_ratios.pop(self.selected_preview_path, None)
         self._logo_pos_ratio = None
         self.custom_pos_label.grid_remove()
         self.reset_pos_button.grid_remove()
+        self._save_current_image_settings()
         self._schedule_preview()
 
     def _reset_logo_position(self) -> None:
+        if self.selected_preview_path is not None:
+            self._per_image_pos_ratios.pop(self.selected_preview_path, None)
         self._logo_pos_ratio = None
         self.custom_pos_label.grid_remove()
         self.reset_pos_button.grid_remove()
+        self._save_current_image_settings()
         self._schedule_preview()
 
     def _on_scale_changed(self, value: float) -> None:
-        self.scale_display_var.set(f"{int(value)}%")
+        v = int(value)
+        self.scale_display_var.set(f"{v}%")
+        if self.selected_preview_path is None:
+            self._global_landscape_scale = v
+        self._save_current_image_settings()
         self._schedule_preview()
+
+    def _on_scale_portrait_changed(self, value: float) -> None:
+        v = int(value)
+        self.scale_portrait_display_var.set(f"{v}%")
+        if self.selected_preview_path is None:
+            self._global_portrait_scale = v
+        self._save_current_image_settings()
+        self._schedule_preview()
+
+    def _toggle_per_image_mode(self) -> None:
+        pass  # kept for compatibility; no longer used
+
+    def _reset_per_image_override(self) -> None:
+        pass  # kept for compatibility; no longer used
+
+    def _save_current_settings_if_per_image(self, force: bool = False) -> None:
+        self._save_current_image_settings()
+
+    def _save_current_image_settings(self) -> None:
+        """Persist current UI state as this image's override."""
+        if self.selected_preview_path is None:
+            return
+        pos = THAI_TO_POSITION.get(self.position_thai_var.get(), "bottom-right")
+        self._per_image_overrides[self.selected_preview_path] = PlacementSettings(
+            landscape_position=pos,
+            portrait_position=pos,
+            output_size_mode=self.output_size_var.get(),
+            logo_scale_percent=self.logo_scale_var.get(),
+            landscape_logo_scale_percent=self.logo_scale_var.get(),
+            portrait_logo_scale_percent=self.logo_scale_portrait_var.get(),
+            margin=0,
+        )
+        self._update_filmstrip_badges()
+
+    def _apply_to_all(self) -> None:
+        """Copy the current image's settings to every loaded image."""
+        if self.selected_preview_path is None:
+            return
+        self._save_current_image_settings()
+        src = self._per_image_overrides.get(self.selected_preview_path)
+        if src is None:
+            return
+        for path in self.image_paths:
+            self._per_image_overrides[path] = src
+            # Copy drag position too
+            ratio = self._per_image_pos_ratios.get(self.selected_preview_path)
+            if ratio is not None:
+                self._per_image_pos_ratios[path] = ratio
+            else:
+                self._per_image_pos_ratios.pop(path, None)
+        self._update_filmstrip_badges()
+
+    def _reset_all_overrides(self) -> None:
+        """Clear all per-image overrides; every image reverts to global defaults."""
+        self._per_image_overrides.clear()
+        self._per_image_pos_ratios.clear()
+        self._logo_pos_ratio = None
+        self.custom_pos_label.grid_remove()
+        self.reset_pos_button.grid_remove()
+        # Reload current image (will show global defaults)
+        if self.selected_preview_path is not None:
+            self._load_settings_for_image(self.selected_preview_path)
+        self._update_filmstrip_badges()
+        self._schedule_preview()
+
+    def _update_filmstrip_badges(self) -> None:
+        """Refresh thumbnail borders: teal=selected, default=others."""
+        bg = self.filmstrip_inner.cget("bg")
+        for p, container in self._thumb_containers.items():
+            container.configure(bg=TEAL if p == self.selected_preview_path else bg)
 
     def _get_settings(self) -> PlacementSettings:
         pos = THAI_TO_POSITION.get(self.position_thai_var.get(), "bottom-right")
@@ -882,40 +1102,75 @@ class AutoWatermarkWindow(ctk.CTk):
             landscape_position=pos,
             portrait_position=pos,
             output_size_mode=self.output_size_var.get(),
-            logo_scale_percent=self.logo_scale_var.get(),
+            logo_scale_percent=self._global_landscape_scale,
+            landscape_logo_scale_percent=self._global_landscape_scale,
+            portrait_logo_scale_percent=self._global_portrait_scale,
             margin=0,
         )
 
     def _build_settings_by_path(self) -> dict[Path, PlacementSettings]:
-        """Per-image settings when logo was dragged to a custom position."""
-        if self._logo_pos_ratio is None or self._logo_pil is None:
-            return {}
-
-        ratio_x, ratio_y = self._logo_pos_ratio
-        scale_pct = self.logo_scale_var.get()
+        """Combine per-image overrides with per-image drag-position adjustments."""
         result: dict[Path, PlacementSettings] = {}
 
+        # Build per-image settings: merge scale override + drag position for every image
+        if self._logo_pil is None:
+            return result
+
         for path in self.image_paths:
+            override = self._per_image_overrides.get(path)
+            ratio = self._per_image_pos_ratios.get(path)
+
+            # No custom settings at all → use global (no entry needed)
+            if override is None and ratio is None:
+                continue
+
+            # Resolve scale and output_size from override or globals
+            l_scale = override.effective_landscape_scale() if override else self._global_landscape_scale
+            p_scale = override.effective_portrait_scale()  if override else self._global_portrait_scale
+            output_size = override.output_size_mode if override else self.output_size_var.get()
+            pos_key = override.landscape_position if override else THAI_TO_POSITION.get(
+                self.position_thai_var.get(), "top-right")
+
+            if ratio is None:
+                # Scale/settings override only — no drag position
+                result[path] = override  # type: ignore[assignment]
+                continue
+
+            # Drag position exists: embed it as pixel offset
             try:
                 with Image.open(path) as img:
                     orig_w, orig_h = img.size
-                out_w = TARGET_WIDTH
-                out_h = round(TARGET_WIDTH / orig_w * orig_h)
+
+                from core.models import OUTPUT_SIZE_ORIGINAL
+                if output_size == OUTPUT_SIZE_ORIGINAL:
+                    out_w, out_h = orig_w, orig_h
+                else:
+                    out_w = TARGET_WIDTH
+                    out_h = round(TARGET_WIDTH / orig_w * orig_h)
+
+                orientation = "landscape" if orig_w > orig_h else "portrait"
+                scale_pct = l_scale if orientation == "landscape" else p_scale
+
                 logo_w = max(1, round(out_w * scale_pct / 100))
-                logo_h = max(1, round(
-                    logo_w * self._logo_pil.height / self._logo_pil.width))
-                logo_x = max(0, min(round(ratio_x * out_w), out_w - logo_w))
-                logo_y = max(0, min(round(ratio_y * out_h), out_h - logo_h))
+                logo_h = max(1, round(logo_w * self._logo_pil.height / self._logo_pil.width))
+                logo_x = max(0, min(round(ratio[0] * out_w), out_w - logo_w))
+                logo_y = max(0, min(round(ratio[1] * out_h), out_h - logo_h))
+
                 result[path] = PlacementSettings(
                     landscape_position="top-left",
                     portrait_position="top-left",
+                    output_size_mode=output_size,
                     margin=0,
                     offset_x=logo_x,
                     offset_y=logo_y,
-                    logo_scale_percent=scale_pct,
+                    logo_scale_percent=l_scale,
+                    landscape_logo_scale_percent=l_scale,
+                    portrait_logo_scale_percent=p_scale,
                 )
             except Exception:
-                pass
+                if override is not None:
+                    result[path] = override
+
         return result
 
     def _update_start_button(self) -> None:

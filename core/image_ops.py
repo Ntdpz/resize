@@ -130,10 +130,15 @@ def build_watermark_scene(
 
     transposed_logo = ImageOps.exif_transpose(logo) or logo
     logo_rgba = transposed_logo.convert("RGBA")
+    effective_scale = (
+        settings.effective_landscape_scale()
+        if orientation == "landscape"
+        else settings.effective_portrait_scale()
+    )
     logo_size = calculate_logo_size(
         base_image.width,
         logo_rgba,
-        settings.logo_scale_percent,
+        effective_scale,
     )
     resized_logo = logo_rgba.resize(logo_size, Image.Resampling.LANCZOS)
     position = calculate_position(

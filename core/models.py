@@ -30,8 +30,16 @@ class PlacementSettings:
     offset_x: int = 0
     offset_y: int = 0
     margin: int = 50
-    logo_scale_percent: int = 18
+    logo_scale_percent: int = 18          # kept for backward-compat / fallback
+    landscape_logo_scale_percent: int = 0  # 0 = use logo_scale_percent
+    portrait_logo_scale_percent: int = 0   # 0 = use logo_scale_percent
     quality: int = 95
+
+    def effective_landscape_scale(self) -> int:
+        return self.landscape_logo_scale_percent or self.logo_scale_percent
+
+    def effective_portrait_scale(self) -> int:
+        return self.portrait_logo_scale_percent or self.logo_scale_percent
 
 
 @dataclass(frozen=True)
