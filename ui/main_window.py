@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox
 from typing import cast
 
 import customtkinter as ctk  # type: ignore[import-untyped]
-from PIL import Image, ImageTk  # type: ignore[import-untyped]
+from PIL import Image, ImageOps, ImageTk  # type: ignore[import-untyped]
 
 from core.image_ops import build_watermark_scene, create_preview_base
 from core.models import (
@@ -53,6 +53,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self._events: queue.Queue[AppEvent] = queue.Queue()
         self._preview_render_after_id: str | None = None
         self._gallery_render_after_id: str | None = None
+        self._poll_events_after_id: str | None = None
         self._gallery_render_paths: tuple[Path, ...] = ()
         self._gallery_render_index = 0
 
@@ -93,6 +94,12 @@ class AutoWatermarkWindow(ctk.CTk):
         self.workflow_note_var = ctk.StringVar(
             value="Quick: หน้าจอเรียบ ใช้ Result preview เป็นหลัก"
         )
+        self.position_hint_var = ctk.StringVar(
+            value=(
+                "Landscape ใช้กับรูปแนวนอน, Portrait / Square "
+                "ใช้กับรูปแนวตั้งหรือจัตุรัส"
+            )
+        )
         self.output_size_note_var = ctk.StringVar(
             value="ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
         )
@@ -105,7 +112,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self._update_gallery_visibility()
         self._update_preview_layout_visibility()
         self._render_previews()
-        self.after(120, self._poll_events)
+        self._poll_events_after_id = self.after(120, self._poll_events)
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -332,8 +339,22 @@ class AutoWatermarkWindow(ctk.CTk):
         )
         ctk.CTkLabel(
             left_controls,
+            textvariable=self.position_hint_var,
+            wraplength=320,
+            justify="left",
+            text_color=("#5b6472", "#b0b8c4"),
+        ).grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            padx=18,
+            pady=(4, 10),
+            sticky="w",
+        )
+        ctk.CTkLabel(
+            left_controls,
             text="Output Size",
-        ).grid(row=3, column=0, padx=18, pady=(10, 6), sticky="w")
+        ).grid(row=4, column=0, padx=18, pady=(10, 6), sticky="w")
         ctk.CTkSegmentedButton(
             left_controls,
             values=[OUTPUT_SIZE_RESIZE_1280, OUTPUT_SIZE_ORIGINAL],
@@ -341,7 +362,7 @@ class AutoWatermarkWindow(ctk.CTk):
             command=self._on_output_size_changed,
             dynamic_resizing=False,
         ).grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=2,
             padx=18,
@@ -355,7 +376,7 @@ class AutoWatermarkWindow(ctk.CTk):
             justify="left",
             text_color=("#5b6472", "#b0b8c4"),
         ).grid(
-            row=5,
+            row=6,
             column=0,
             columnspan=2,
             padx=18,
@@ -1021,6 +1042,35 @@ class AutoWatermarkWindow(ctk.CTk):
             logo_scale_percent=self.logo_scale_var.get(),
         )
 
+    def _update_position_hint(self) -> None:
+        default_hint = (
+            "Landscape ใช้กับรูปแนวนอน, "
+            "Portrait / Square ใช้กับรูปแนวตั้งหรือจัตุรัส"
+        )
+        if self.preview_source_path is None:
+            self.position_hint_var.set(default_hint)
+            return
+
+        try:
+            source_image = self._get_cached_scene_image(
+                self.preview_source_path
+            )
+        except OSError:
+            self.position_hint_var.set(default_hint)
+            return
+
+        oriented_image = ImageOps.exif_transpose(source_image) or source_image
+        if oriented_image.width > oriented_image.height:
+            self.position_hint_var.set(
+                "รูปปัจจุบัน: Landscape. ตอนนี้ dropdown Landscape มีผลทันที"
+            )
+            return
+
+        self.position_hint_var.set(
+            "รูปปัจจุบัน: Portrait / Square. "
+            "ตอนนี้ dropdown Portrait / Square มีผลทันที"
+        )
+
     def _build_request(self) -> BatchRequest | None:
         self._persist_current_preview_settings()
         if self.logo_path is None:
@@ -1107,7 +1157,22 @@ class AutoWatermarkWindow(ctk.CTk):
         except queue.Empty:
             pass
         finally:
-            self.after(120, self._poll_events)
+            self._poll_events_after_id = self.after(120, self._poll_events)
+
+    def destroy(self) -> None:
+        callback_ids = (
+            self._preview_render_after_id,
+            self._gallery_render_after_id,
+            self._poll_events_after_id,
+        )
+        for callback_id in callback_ids:
+            if callback_id is None:
+                continue
+            try:
+                self.after_cancel(callback_id)
+            except tk.TclError:
+                pass
+        super().destroy()
 
     def _handle_done(self, results: list[ProcessedFile]) -> None:
         self.progress_var.set(1)
@@ -1158,6 +1223,7 @@ class AutoWatermarkWindow(ctk.CTk):
     def _render_previews(self) -> None:
         self._preview_render_after_id = None
         self._persist_current_preview_settings()
+        self._update_position_hint()
         if self.workflow_mode_var.get() == "review":
             self._set_preview_image(
                 self.logo_preview_label,
