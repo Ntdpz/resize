@@ -6,1554 +6,893 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import cast
 
 import customtkinter as ctk  # type: ignore[import-untyped]
 from PIL import Image, ImageOps, ImageTk  # type: ignore[import-untyped]
 
-from core.image_ops import build_watermark_scene, create_preview_base
+from core.image_ops import calculate_position
 from core.models import (
-    OUTPUT_SIZE_ORIGINAL,
-    OUTPUT_SIZE_RESIZE_1280,
-    POSITION_PRESETS,
     BatchRequest,
+    OUTPUT_SIZE_RESIZE_1280,
+    OUTPUT_SIZE_ORIGINAL,
     PlacementSettings,
-    ProcessedFile,
+    SUPPORTED_EXTENSIONS,
 )
-from core.processor import discover_images, get_output_folder, process_batch
+from core.processor import process_batch
 
+# ── Constants ──────────────────────────────────────────────────────────
+TEAL = "#00c896"
+TEAL_DARK = "#00a87a"
+THUMB_SIZE = (90, 90)
+PREVIEW_DEBOUNCE_MS = 350
+TARGET_WIDTH = 1280
 
-ProgressPayload = tuple[int, int, str]
 AppEvent = tuple[str, object]
-PREVIEW_IMAGE_SIZE = (320, 220)
-LOGO_PREVIEW_SIZE = (180, 180)
-SOURCE_PREVIEW_SIZE = (220, 220)
-RESULT_CANVAS_SIZE = (360, 520)
-GALLERY_THUMBNAIL_SIZE = (72, 72)
-PREVIEW_RENDER_DELAY_MS = 45
-GALLERY_RENDER_BATCH_SIZE = 12
-GALLERY_RENDER_DELAY_MS = 12
+
+POSITION_THAI: dict[str, str] = {
+    "top-left":      "มุมซ้ายบน",
+    "top-center":    "กลางบน",
+    "top-right":     "มุมขวาบน",
+    "middle-left":   "กลางซ้าย",
+    "center":        "ตรงกลาง",
+    "middle-right":  "กลางขวา",
+    "bottom-left":   "มุมซ้ายล่าง",
+    "bottom-center": "กลางล่าง",
+    "bottom-right":  "มุมขวาล่าง",
+}
+THAI_TO_POSITION: dict[str, str] = {v: k for k, v in POSITION_THAI.items()}
 
 
 class AutoWatermarkWindow(ctk.CTk):
+    """Main window — left controls, right canvas preview + filmstrip."""
+
     def __init__(self) -> None:
         super().__init__()
-        self.title("Auto Watermark & Resize Tool")
-        self.geometry("1360x880")
-        self.minsize(1120, 760)
+        self.title("Auto Watermark & Resize")
+        self.geometry("1020x700")
+        self.minsize(820, 560)
 
+        # ── App state ──────────────────────────────────────────────────
         self.logo_path: Path | None = None
-        self.selection_anchor_path: Path | None = None
-        self.selected_paths: tuple[Path, ...] = ()
-        self.preview_source_path: Path | None = None
+        self.image_paths: list[Path] = []
+        self.selected_preview_path: Path | None = None
         self.last_output_folder: Path | None = None
-        self.image_settings_by_path: dict[Path, PlacementSettings] = {}
 
+        # ── Threading ──────────────────────────────────────────────────
         self._worker: threading.Thread | None = None
         self._events: queue.Queue[AppEvent] = queue.Queue()
-        self._preview_render_after_id: str | None = None
-        self._gallery_render_after_id: str | None = None
-        self._poll_events_after_id: str | None = None
-        self._gallery_render_paths: tuple[Path, ...] = ()
-        self._gallery_render_index = 0
+        self._preview_debounce_id: str | None = None
 
-        self._logo_preview_image: ctk.CTkImage | None = None
-        self._source_preview_image: ctk.CTkImage | None = None
-        self._result_preview_base_image: ImageTk.PhotoImage | None = None
-        self._result_preview_logo_image: ImageTk.PhotoImage | None = None
-        self._result_preview_logo_bbox: tuple[int, int, int, int] | None = None
-        self._result_preview_anchor_position: tuple[int, int] | None = None
-        self._result_preview_drag_origin: tuple[int, int] | None = None
-        self._result_preview_drag_position: tuple[int, int] | None = None
-        self._gallery_thumbnail_images: dict[Path, ctk.CTkImage] = {}
-        self._gallery_buttons: dict[Path, ctk.CTkButton] = {}
-        self._thumbnail_cache: dict[
-            tuple[Path, bool, tuple[int, int]], tuple[int, Image.Image]
-        ] = {}
-        self._scene_image_cache: dict[Path, tuple[int, Image.Image]] = {}
+        # ── Image caches ───────────────────────────────────────────────
+        self._logo_pil: Image.Image | None = None
+        self._logo_ctk: ctk.CTkImage | None = None
+        self._preview_base_photo: ImageTk.PhotoImage | None = None
+        self._preview_logo_photo: ImageTk.PhotoImage | None = None
+        self._thumb_pil_cache: dict[Path, Image.Image] = {}
+        self._thumb_photos: dict[Path, ImageTk.PhotoImage] = {}
+        self._thumb_labels: dict[Path, tk.Label] = {}
+        self._thumb_containers: dict[Path, tk.Frame] = {}
 
-        self.selection_mode_var = ctk.StringVar(value="folder")
-        self.workflow_mode_var = ctk.StringVar(value="quick")
+        # ── Drag / free-position state ─────────────────────────────────
+        self._canvas_logo_id: int | None = None
+        # Ratio (0.0–1.0) of full-res image; None = use preset
+        self._logo_pos_ratio: tuple[float, float] | None = None
+        self._drag_start_evt: tuple[int, int] | None = None
+        self._drag_start_logo_canvas: tuple[float, float] | None = None
+        self._prev_scale: float = 1.0
+        self._prev_img_offset: tuple[int, int] = (0, 0)
+        self._prev_base_size: tuple[int, int] = (TARGET_WIDTH, 720)
+        self._prev_logo_size_canvas: tuple[int, int] = (0, 0)
+
+        # ── UI variables ───────────────────────────────────────────────
+        self.position_thai_var = ctk.StringVar(value=POSITION_THAI["top-right"])
         self.output_size_var = ctk.StringVar(value=OUTPUT_SIZE_RESIZE_1280)
-        self.landscape_position_var = ctk.StringVar(value="bottom-right")
-        self.portrait_position_var = ctk.StringVar(value="top-right")
-        self.offset_x_var = ctk.IntVar(value=0)
-        self.offset_y_var = ctk.IntVar(value=0)
         self.logo_scale_var = ctk.IntVar(value=18)
+        self.scale_display_var = ctk.StringVar(value="18%")
+        self.progress_var = ctk.DoubleVar(value=0.0)
+        self.status_var = ctk.StringVar(value="")
 
-        self.progress_var = ctk.DoubleVar(value=0)
-        self.status_var = ctk.StringVar(value="พร้อมเริ่มทำงาน")
-        self.logo_name_var = ctk.StringVar(value="ยังไม่ได้เลือกโลโก้")
-        self.source_name_var = ctk.StringVar(
-            value="ยังไม่ได้เลือกรูปหรือโฟลเดอร์"
-        )
-        self.image_count_var = ctk.StringVar(value="โหมดโฟลเดอร์")
-        self.gallery_status_var = ctk.StringVar(
-            value="Quick mode พร้อมสำหรับงานเร็ว"
-        )
-        self.workflow_note_var = ctk.StringVar(
-            value="Quick: หน้าจอเรียบ ใช้ Result preview เป็นหลัก"
-        )
-        self.position_hint_var = ctk.StringVar(
-            value=(
-                "Landscape ใช้กับรูปแนวนอน, Portrait / Square "
-                "ใช้กับรูปแนวตั้งหรือจัตุรัส"
-            )
-        )
-        self.output_size_note_var = ctk.StringVar(
-            value="ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
-        )
-        self.scale_value_var = ctk.StringVar(value="18%")
-        self.offset_x_value_var = ctk.StringVar(value="0 px")
-        self.offset_y_value_var = ctk.StringVar(value="0 px")
+        self._build_ui()
+        self.after(100, self._poll_events)
 
-        self._build_layout()
-        self._init_source_picker_command()
-        self._update_gallery_visibility()
-        self._update_preview_layout_visibility()
-        self._render_previews()
-        self._poll_events_after_id = self.after(120, self._poll_events)
+    # ═══════════════════════════════════════════════════════════════════
+    # BUILD UI
+    # ═══════════════════════════════════════════════════════════════════
 
-    def _build_layout(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self._build_left_panel()
+        self._build_right_panel()
 
-        container = ctk.CTkScrollableFrame(self, corner_radius=20)
-        container.grid(row=0, column=0, padx=18, pady=18, sticky="nsew")
-        container.grid_columnconfigure(0, minsize=420)
-        container.grid_columnconfigure(1, weight=1)
-        container.grid_rowconfigure(1, weight=1)
+    # ── Left panel ─────────────────────────────────────────────────────
 
-        header = ctk.CTkFrame(container, fg_color="transparent")
-        header.grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            padx=24,
-            pady=(24, 12),
-            sticky="ew",
+    def _build_left_panel(self) -> None:
+        panel = ctk.CTkFrame(self, width=264, corner_radius=0)
+        panel.grid(row=0, column=0, sticky="nsew")
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(4, weight=1)
+
+        brand = ctk.CTkFrame(panel, fg_color="transparent")
+        brand.grid(row=0, column=0, padx=16, pady=(20, 14), sticky="ew")
+        ctk.CTkLabel(
+            brand, text="Auto Watermark",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            brand, text="Resize · Watermark · Export",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray55"),
+        ).pack(anchor="w")
+
+        self._build_logo_zone(panel, row=1)
+        self._build_input_zone(panel, row=2)
+        self._build_settings(panel, row=3)
+        ctk.CTkFrame(panel, fg_color="transparent").grid(row=4, column=0, sticky="nsew")
+        self._build_progress_section(panel, row=5)
+        self._build_footer(panel, row=6)
+
+    def _build_logo_zone(self, parent: ctk.CTkFrame, row: int) -> None:
+        self.logo_card = ctk.CTkFrame(parent, corner_radius=12)
+        self.logo_card.grid(row=row, column=0, padx=12, pady=(0, 8), sticky="ew")
+        self.logo_card.grid_columnconfigure(1, weight=1)
+
+        self.logo_thumb_label = ctk.CTkLabel(
+            self.logo_card, text="🖼",
+            font=ctk.CTkFont(size=24),
+            width=52, height=52, corner_radius=8,
+            fg_color=("gray82", "gray25"),
         )
+        self.logo_thumb_label.grid(row=0, column=0, padx=(12, 8), pady=12)
+
+        txt = ctk.CTkFrame(self.logo_card, fg_color="transparent")
+        txt.grid(row=0, column=1, pady=12, sticky="ew")
+        ctk.CTkLabel(
+            txt, text="โลโก้ (.png)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w")
+        self.logo_name_label = ctk.CTkLabel(
+            txt, text="ยังไม่ได้เลือก",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray55"),
+            wraplength=130, justify="left",
+        )
+        self.logo_name_label.pack(anchor="w")
+
+        ctk.CTkButton(
+            self.logo_card, text="เลือก",
+            width=58, height=30, font=ctk.CTkFont(size=12),
+            fg_color=("gray78", "gray32"),
+            text_color=("gray10", "gray90"),
+            hover_color=("gray68", "gray42"),
+            command=self._choose_logo,
+        ).grid(row=0, column=2, padx=(0, 12))
+
+    def _build_input_zone(self, parent: ctk.CTkFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=12)
+        card.grid(row=row, column=0, padx=12, pady=(0, 8), sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.grid(row=0, column=0, padx=14, pady=(12, 6), sticky="ew")
         header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header, text="📁  รูปภาพต้นฉบับ",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.image_count_badge = ctk.CTkLabel(
+            header, text="",
+            font=ctk.CTkFont(size=11),
+            fg_color=TEAL, text_color="white", corner_radius=8,
+        )
+
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.grid(row=1, column=0, padx=14, pady=(0, 6), sticky="ew")
+        btn_row.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(
+            btn_row, text="เลือกหลายไฟล์",
+            height=34, font=ctk.CTkFont(size=12),
+            command=self._choose_files,
+        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        ctk.CTkButton(
+            btn_row, text="เลือกโฟลเดอร์",
+            height=34, font=ctk.CTkFont(size=12),
+            command=self._choose_folder,
+        ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
+        self.clear_button = ctk.CTkButton(
+            card, text="🗑  ล้างรายการทั้งหมด",
+            height=28, font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            text_color=("gray40", "gray60"),
+            hover_color=("gray80", "gray28"),
+            border_width=1,
+            border_color=("gray70", "gray40"),
+            command=self._clear_images,
+        )
+        self.clear_button.grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self.clear_button.grid_remove()
+
+        self.input_status_label = ctk.CTkLabel(
+            card, text="ยังไม่ได้เลือกรูปภาพ",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray55"),
+        )
+        self.input_status_label.grid(row=3, column=0, padx=14, pady=(0, 10), sticky="w")
+
+    def _build_settings(self, parent: ctk.CTkFrame, row: int) -> None:
+        self.settings_card = ctk.CTkFrame(parent, corner_radius=12)
+        self.settings_card.grid(row=row, column=0, padx=12, pady=(0, 8), sticky="ew")
+        self.settings_card.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            header,
-            text="Auto Watermark & Resize Tool",
-            font=ctk.CTkFont(size=28, weight="bold"),
+            self.settings_card, text="⚙  ตั้งค่าโลโก้",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=0, padx=14, pady=(12, 8), sticky="w")
+
+        ctk.CTkLabel(
+            self.settings_card, text="ตำแหน่ง", font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, padx=14, pady=(0, 4), sticky="w")
+
+        ctk.CTkOptionMenu(
+            self.settings_card,
+            values=list(POSITION_THAI.values()),
+            variable=self.position_thai_var,
+            command=self._on_position_changed,
+        ).grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+        self.custom_pos_label = ctk.CTkLabel(
+            self.settings_card,
+            text="📍 กำหนดเอง  (ลากโลโก้บน preview)",
+            font=ctk.CTkFont(size=11), text_color=TEAL,
+        )
+        self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
+        self.custom_pos_label.grid_remove()
+
+        self.reset_pos_button = ctk.CTkButton(
+            self.settings_card, text="รีเซ็ตตำแหน่ง",
+            height=26, font=ctk.CTkFont(size=11),
+            fg_color=("gray78", "gray32"),
+            text_color=("gray10", "gray90"),
+            hover_color=("gray68", "gray42"),
+            command=self._reset_logo_position,
+        )
+        self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self.reset_pos_button.grid_remove()
+
+        scale_header = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        scale_header.grid(row=5, column=0, padx=14, pady=(4, 4), sticky="ew")
+        scale_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            scale_header, text="ขนาดโลโก้", font=ctk.CTkFont(size=12),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            header,
-            text=(
-                "เลือกรูปเดี่ยวหรือทั้งโฟลเดอร์ พร้อมดู preview "
-                "โลโก้ ต้นฉบับ และผลลัพธ์ก่อนเริ่มงาน"
-            ),
-            text_color=("#5b6472", "#b0b8c4"),
-            font=ctk.CTkFont(size=14),
-        ).grid(row=1, column=0, pady=(4, 0), sticky="w")
+            scale_header, textvariable=self.scale_display_var,
+            font=ctk.CTkFont(size=12), text_color=TEAL,
+        ).grid(row=0, column=1, sticky="e")
 
-        left_panel = ctk.CTkFrame(container)
-        left_panel.grid(
-            row=1,
-            column=0,
-            padx=(24, 12),
-            pady=(0, 24),
-            sticky="nsew",
-        )
-        left_panel.grid_columnconfigure(0, weight=1)
-
-        right_panel = ctk.CTkFrame(container)
-        right_panel.grid(
-            row=1,
-            column=1,
-            padx=(12, 24),
-            pady=(0, 24),
-            sticky="nsew",
-        )
-        right_panel.grid_columnconfigure(0, weight=0, minsize=220)
-        right_panel.grid_columnconfigure(1, weight=0, minsize=240)
-        right_panel.grid_columnconfigure(2, weight=1, minsize=380)
-        right_panel.grid_rowconfigure(1, weight=1)
-
-        self._build_selection_section(left_panel)
-        self._build_controls_section(left_panel)
-        self._build_status_section(left_panel)
-        self._build_footer(left_panel)
-        self._build_preview_section(right_panel)
-
-    def _build_selection_section(self, parent: ctk.CTkFrame) -> None:
-        selection_frame = ctk.CTkFrame(parent)
-        selection_frame.grid(
-            row=0,
-            column=0,
-            padx=18,
-            pady=(18, 10),
-            sticky="ew",
-        )
-        selection_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkSlider(
+            self.settings_card,
+            from_=5, to=40,
+            variable=self.logo_scale_var,
+            button_color=TEAL, button_hover_color=TEAL_DARK, progress_color=TEAL,
+            command=self._on_scale_changed,
+        ).grid(row=6, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
-            selection_frame,
-            text="1. เลือกโลโก้และรูปต้นฉบับ",
-            font=ctk.CTkFont(size=20, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(18, 12), sticky="w")
+            self.settings_card, text="ขนาดเอาต์พุต", font=ctk.CTkFont(size=12),
+        ).grid(row=7, column=0, padx=14, pady=(8, 4), sticky="w")
 
-        self._build_picker_card(
-            selection_frame,
-            row=1,
-            title="ไฟล์โลโก้ PNG",
-            value_var=self.logo_name_var,
-            action_text="เลือกไฟล์โลโก้ .png",
-            callback=self._choose_logo,
-        )
-
-        source_card = ctk.CTkFrame(selection_frame)
-        source_card.grid(row=2, column=0, padx=18, pady=(10, 18), sticky="ew")
-        source_card.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            source_card,
-            text="รูปต้นฉบับ",
-            font=ctk.CTkFont(size=17, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(18, 10), sticky="w")
         ctk.CTkSegmentedButton(
-            source_card,
-            values=["folder", "single"],
-            variable=self.selection_mode_var,
-            command=self._on_selection_mode_changed,
-        ).grid(row=1, column=0, padx=18, pady=(0, 12), sticky="ew")
-        ctk.CTkLabel(
-            source_card,
-            textvariable=self.source_name_var,
-            wraplength=340,
-            justify="left",
-        ).grid(row=2, column=0, padx=18, pady=(0, 6), sticky="w")
-        ctk.CTkLabel(
-            source_card,
-            textvariable=self.image_count_var,
-            text_color=("#5b6472", "#b0b8c4"),
-        ).grid(row=3, column=0, padx=18, pady=(0, 10), sticky="w")
-        self.source_picker_button = ctk.CTkButton(
-            source_card,
-            text="เลือกโฟลเดอร์รูปภาพ",
-            command=self._choose_folder,
-        )
-        self.source_picker_button.grid(
-            row=4,
-            column=0,
-            padx=18,
-            pady=(0, 12),
-            sticky="ew",
-        )
-
-        self.workflow_mode_button = ctk.CTkSegmentedButton(
-            source_card,
-            values=["quick", "review"],
-            variable=self.workflow_mode_var,
-            command=self._on_workflow_mode_changed,
-        )
-        self.workflow_mode_button.grid(
-            row=5,
-            column=0,
-            padx=18,
-            pady=(0, 12),
-            sticky="ew",
-        )
-        self.workflow_mode_button.set("quick")
-        ctk.CTkLabel(
-            source_card,
-            textvariable=self.workflow_note_var,
-            wraplength=340,
-            justify="left",
-            text_color=("#5b6472", "#b0b8c4"),
-        ).grid(row=6, column=0, padx=18, pady=(0, 10), sticky="w")
-
-        self.gallery_title_label = ctk.CTkLabel(
-            source_card,
-            text="Gallery / รายการรูป",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        )
-        self.gallery_title_label.grid(
-            row=7,
-            column=0,
-            padx=18,
-            pady=(0, 6),
-            sticky="w",
-        )
-        self.gallery_status_label = ctk.CTkLabel(
-            source_card,
-            textvariable=self.gallery_status_var,
-            wraplength=340,
-            justify="left",
-            text_color=("#5b6472", "#b0b8c4"),
-        )
-        self.gallery_status_label.grid(
-            row=8,
-            column=0,
-            padx=18,
-            pady=(0, 8),
-            sticky="w",
-        )
-        self.gallery_frame = ctk.CTkScrollableFrame(source_card, height=220)
-        self.gallery_frame.grid(
-            row=9,
-            column=0,
-            padx=18,
-            pady=(0, 18),
-            sticky="ew",
-        )
-        self.gallery_frame.grid_columnconfigure(0, weight=1)
-
-    def _build_controls_section(self, parent: ctk.CTkFrame) -> None:
-        controls = ctk.CTkFrame(parent)
-        controls.grid(row=1, column=0, padx=18, pady=10, sticky="ew")
-        controls.grid_columnconfigure((0, 1), weight=1)
-
-        left_controls = ctk.CTkFrame(controls)
-        left_controls.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
-        left_controls.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            left_controls,
-            text="2. ตำแหน่งโลโก้",
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            padx=18,
-            pady=(18, 10),
-            sticky="w",
-        )
-        self._add_option_menu(
-            left_controls,
-            row=1,
-            label="Landscape",
-            variable=self.landscape_position_var,
-            values=list(POSITION_PRESETS),
-        )
-        self._add_option_menu(
-            left_controls,
-            row=2,
-            label="Portrait / Square",
-            variable=self.portrait_position_var,
-            values=list(POSITION_PRESETS),
-        )
-        ctk.CTkLabel(
-            left_controls,
-            textvariable=self.position_hint_var,
-            wraplength=320,
-            justify="left",
-            text_color=("#5b6472", "#b0b8c4"),
-        ).grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            padx=18,
-            pady=(4, 10),
-            sticky="w",
-        )
-        ctk.CTkLabel(
-            left_controls,
-            text="Output Size",
-        ).grid(row=4, column=0, padx=18, pady=(10, 6), sticky="w")
-        ctk.CTkSegmentedButton(
-            left_controls,
+            self.settings_card,
             values=[OUTPUT_SIZE_RESIZE_1280, OUTPUT_SIZE_ORIGINAL],
             variable=self.output_size_var,
+            selected_color=TEAL,
+            selected_hover_color=TEAL_DARK,
+            font=ctk.CTkFont(size=11),
             command=self._on_output_size_changed,
-            dynamic_resizing=False,
-        ).grid(
-            row=5,
-            column=0,
-            columnspan=2,
-            padx=18,
-            pady=(0, 6),
-            sticky="ew",
-        )
-        ctk.CTkLabel(
-            left_controls,
-            textvariable=self.output_size_note_var,
-            wraplength=320,
-            justify="left",
-            text_color=("#5b6472", "#b0b8c4"),
-        ).grid(
-            row=6,
-            column=0,
-            columnspan=2,
-            padx=18,
-            pady=(0, 18),
-            sticky="w",
-        )
-
-        right_controls = ctk.CTkFrame(controls)
-        right_controls.grid(
-            row=0,
-            column=1,
-            padx=(8, 0),
-            pady=0,
-            sticky="nsew",
-        )
-        right_controls.grid_columnconfigure(0, weight=1)
+        ).grid(row=8, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
-            right_controls,
-            text="3. ขนาดและระยะขยับ",
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(18, 10), sticky="w")
-        self._add_slider(
-            right_controls,
-            row=1,
-            label="ขนาดโลโก้",
-            variable=self.logo_scale_var,
-            display_var=self.scale_value_var,
-            from_=5,
-            to=40,
-            suffix="%",
-        )
-        self._add_slider(
-            right_controls,
-            row=2,
-            label="เลื่อนแนวนอน",
-            variable=self.offset_x_var,
-            display_var=self.offset_x_value_var,
-            from_=-300,
-            to=300,
-            suffix=" px",
-        )
-        self._add_slider(
-            right_controls,
-            row=3,
-            label="เลื่อนแนวตั้ง",
-            variable=self.offset_y_var,
-            display_var=self.offset_y_value_var,
-            from_=-300,
-            to=300,
-            suffix=" px",
-        )
+            self.settings_card,
+            text="💡 ลากโลโก้บน preview · Scroll ปรับขนาด",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray50", "gray55"),
+        ).grid(row=9, column=0, padx=14, pady=(0, 12), sticky="w")
 
-    def _build_status_section(self, parent: ctk.CTkFrame) -> None:
-        progress_frame = ctk.CTkFrame(parent)
-        progress_frame.grid(row=2, column=0, padx=18, pady=10, sticky="ew")
-        progress_frame.grid_columnconfigure(0, weight=1)
+    def _build_progress_section(self, parent: ctk.CTkFrame, row: int) -> None:
+        self.progress_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.progress_frame.grid(row=row, column=0, padx=12, pady=(0, 4), sticky="ew")
+        self.progress_frame.grid_columnconfigure(0, weight=1)
+        self.progress_frame.grid_remove()
 
         ctk.CTkLabel(
-            progress_frame,
-            text="4. สถานะ",
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(18, 10), sticky="w")
-        ctk.CTkLabel(
-            progress_frame,
-            textvariable=self.status_var,
-            font=ctk.CTkFont(size=14),
-        ).grid(row=1, column=0, padx=18, pady=(0, 10), sticky="w")
+            self.progress_frame, textvariable=self.status_var,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray50", "gray55"),
+        ).grid(row=0, column=0, pady=(0, 4), sticky="w")
 
         self.progress_bar = ctk.CTkProgressBar(
-            progress_frame,
-            variable=self.progress_var,
-        )
-        self.progress_bar.grid(
-            row=2,
-            column=0,
-            padx=18,
-            pady=(0, 18),
-            sticky="ew",
-        )
+            self.progress_frame, variable=self.progress_var, progress_color=TEAL)
+        self.progress_bar.grid(row=1, column=0, sticky="ew")
         self.progress_bar.set(0)
 
-    def _build_footer(self, parent: ctk.CTkFrame) -> None:
+    def _build_footer(self, parent: ctk.CTkFrame, row: int) -> None:
         footer = ctk.CTkFrame(parent, fg_color="transparent")
-        footer.grid(row=3, column=0, padx=18, pady=(10, 18), sticky="ew")
-        footer.grid_columnconfigure((0, 1), weight=1)
+        footer.grid(row=row, column=0, padx=12, pady=(4, 18), sticky="ew")
+        footer.grid_columnconfigure(0, weight=1)
 
         self.start_button = ctk.CTkButton(
             footer,
-            text="START / เริ่มประมวลผล",
-            height=52,
-            font=ctk.CTkFont(size=17, weight="bold"),
+            text="▶  START เริ่มประมวลผล",
+            height=52, font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color=TEAL, hover_color=TEAL_DARK,
             command=self._start_processing,
-        )
-        self.start_button.grid(row=0, column=0, padx=(0, 8), sticky="ew")
-
-        self.open_output_button = ctk.CTkButton(
-            footer,
-            text="เปิดโฟลเดอร์ผลลัพธ์",
-            height=52,
-            command=self._open_output_folder,
             state="disabled",
         )
-        self.open_output_button.grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        self.start_button.grid(row=0, column=0, sticky="ew")
 
-    def _build_preview_section(self, parent: ctk.CTkFrame) -> None:
-        self.preview_title_label = ctk.CTkLabel(
-            parent,
-            text="Preview",
-            font=ctk.CTkFont(size=22, weight="bold"),
-        )
-        self.preview_title_label.grid(
-            row=0,
-            column=0,
-            columnspan=3,
-            padx=8,
-            pady=(18, 12),
-            sticky="w",
+        self.open_folder_button = ctk.CTkButton(
+            footer, text="📂  เปิดโฟลเดอร์ผลลัพธ์",
+            height=36, font=ctk.CTkFont(size=12),
+            command=self._open_output_folder,
         )
 
-        self.logo_preview_label = self._build_preview_card(
-            parent,
-            column=0,
-            title="Logo",
-            placeholder="ยังไม่มีโลโก้",
-            width=220,
-            height=220,
-        )
-        self.source_preview_label = self._build_preview_card(
-            parent,
-            column=1,
-            title="Source",
-            placeholder="ยังไม่มีรูปต้นฉบับ",
-            width=240,
-            height=300,
-        )
-        self.result_preview_canvas = self._build_result_preview_card(
-            parent,
-            column=2,
-            title="Result",
-        )
+    # ── Right panel ────────────────────────────────────────────────────
 
-    def _build_picker_card(
-        self,
-        parent: ctk.CTkFrame,
-        row: int,
-        title: str,
-        value_var: ctk.StringVar,
-        action_text: str,
-        callback,
-    ) -> None:
-        frame = ctk.CTkFrame(parent)
-        frame.grid(row=row, column=0, padx=18, pady=0, sticky="ew")
-        frame.grid_columnconfigure(0, weight=1)
+    def _build_right_panel(self) -> None:
+        right = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray90", "gray13"))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_rowconfigure(1, minsize=118)
 
-        ctk.CTkLabel(
-            frame,
-            text=title,
-            font=ctk.CTkFont(size=17, weight="bold"),
-        ).grid(row=0, column=0, padx=18, pady=(18, 10), sticky="w")
-        ctk.CTkLabel(
-            frame,
-            textvariable=value_var,
-            wraplength=340,
-            justify="left",
-        ).grid(row=1, column=0, padx=18, pady=(0, 10), sticky="w")
-        ctk.CTkButton(frame, text=action_text, command=callback).grid(
-            row=2,
-            column=0,
-            padx=18,
-            pady=(0, 18),
-            sticky="ew",
-        )
+        # Preview canvas (2 layers: base + draggable logo)
+        self.preview_outer = ctk.CTkFrame(
+            right, corner_radius=0, fg_color=("gray85", "gray11"))
+        self.preview_outer.grid(row=0, column=0, sticky="nsew")
+        self.preview_outer.grid_columnconfigure(0, weight=1)
+        self.preview_outer.grid_rowconfigure(0, weight=1)
 
-    def _build_preview_card(
-        self,
-        parent: ctk.CTkFrame,
-        column: int,
-        title: str,
-        placeholder: str,
-        width: int = 340,
-        height: int = 250,
-    ) -> ctk.CTkLabel:
-        frame = ctk.CTkFrame(parent)
-        frame.grid(row=1, column=column, padx=8, pady=(0, 18), sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(1, weight=1)
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        canvas_bg = "#111111" if is_dark else "#d8d8d8"
 
-        ctk.CTkLabel(
-            frame,
-            text=title,
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=0, padx=16, pady=(16, 10), sticky="w")
-
-        preview_label = ctk.CTkLabel(
-            frame,
-            text=placeholder,
-            width=width,
-            height=height,
-            corner_radius=14,
-            fg_color=("#f1f3f7", "#1f2430"),
-            text_color=("#6a7280", "#c4cad4"),
-        )
-        preview_label.grid(
-            row=1,
-            column=0,
-            padx=16,
-            pady=(0, 16),
-            sticky="nsew",
-        )
-        return preview_label
-
-    def _build_result_preview_card(
-        self,
-        parent: ctk.CTkFrame,
-        column: int,
-        title: str,
-    ) -> tk.Canvas:
-        frame = ctk.CTkFrame(parent)
-        frame.grid(row=1, column=column, padx=8, pady=(0, 18), sticky="nsew")
-        frame.grid_columnconfigure(0, weight=1)
-        frame.grid_rowconfigure(2, weight=1)
-
-        ctk.CTkLabel(
-            frame,
-            text=title,
-            font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
-        ctk.CTkLabel(
-            frame,
-            text="ลากโลโก้เพื่อขยับ และหมุนล้อเมาส์เพื่อย่อ/ขยาย",
-            text_color=("#5b6472", "#b0b8c4"),
-        ).grid(row=1, column=0, padx=16, pady=(0, 10), sticky="w")
-
-        canvas = tk.Canvas(
-            frame,
-            width=RESULT_CANVAS_SIZE[0],
-            height=RESULT_CANVAS_SIZE[1],
-            bd=0,
+        self.preview_canvas = tk.Canvas(
+            self.preview_outer,
+            bg=canvas_bg,
             highlightthickness=0,
-            background="#1f2430",
-            cursor="arrow",
         )
-        canvas.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="nsew")
-        canvas.bind("<Button-1>", self._on_result_preview_press)
-        canvas.bind("<B1-Motion>", self._on_result_preview_drag)
-        canvas.bind("<ButtonRelease-1>", self._on_result_preview_release)
-        canvas.bind("<Motion>", self._on_result_preview_motion)
-        canvas.bind("<MouseWheel>", self._on_result_preview_wheel)
-        return canvas
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas.bind("<Configure>", self._on_preview_resize)
+        self.preview_canvas.bind("<MouseWheel>", self._on_canvas_scroll)
 
-    def _add_option_menu(
-        self,
-        parent: ctk.CTkFrame,
-        row: int,
-        label: str,
-        variable: ctk.StringVar,
-        values: list[str],
-    ) -> None:
-        ctk.CTkLabel(parent, text=label).grid(
-            row=row,
-            column=0,
-            padx=18,
-            pady=10,
-            sticky="w",
+        # Filmstrip
+        film_outer = ctk.CTkFrame(
+            right, height=118, corner_radius=0,
+            fg_color=("gray75", "gray18"))
+        film_outer.grid(row=1, column=0, sticky="nsew")
+        film_outer.grid_propagate(False)
+        film_outer.grid_columnconfigure(0, weight=1)
+        film_outer.grid_rowconfigure(0, weight=1)
+
+        film_bg = "#282828" if is_dark else "#c0c0c0"
+        self.filmstrip_canvas = tk.Canvas(
+            film_outer, height=96, bg=film_bg, highlightthickness=0)
+        self.filmstrip_canvas.grid(row=0, column=0, sticky="ew", pady=(4, 0))
+
+        film_scroll = tk.Scrollbar(
+            film_outer, orient="horizontal",
+            command=self.filmstrip_canvas.xview)
+        film_scroll.grid(row=1, column=0, sticky="ew")
+        self.filmstrip_canvas.configure(xscrollcommand=film_scroll.set)
+
+        self.filmstrip_inner = tk.Frame(self.filmstrip_canvas, bg=film_bg)
+        self._canvas_window = self.filmstrip_canvas.create_window(
+            (0, 0), window=self.filmstrip_inner, anchor="nw")
+        self.filmstrip_inner.bind(
+            "<Configure>",
+            lambda e: self.filmstrip_canvas.configure(
+                scrollregion=self.filmstrip_canvas.bbox("all")))
+        self.filmstrip_canvas.bind("<MouseWheel>", self._filmstrip_scroll)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PLACEHOLDER
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _draw_placeholder(self) -> None:
+        self.preview_canvas.delete("all")
+        w = max(self.preview_canvas.winfo_width(), 10)
+        h = max(self.preview_canvas.winfo_height(), 10)
+        self.preview_canvas.create_text(
+            w // 2, h // 2,
+            text="เลือกโลโก้และรูปภาพ\nจากนั้นคลิก thumbnail ด้านล่างเพื่อดู preview",
+            fill="#606060", font=("Helvetica", 13), justify="center",
         )
-        ctk.CTkOptionMenu(
-            parent,
-            variable=variable,
-            values=values,
-            command=lambda _value: self._schedule_preview_render(),
-        ).grid(row=row, column=1, padx=(0, 18), pady=10, sticky="ew")
 
-    def _add_slider(
-        self,
-        parent: ctk.CTkFrame,
-        row: int,
-        label: str,
-        variable: ctk.IntVar,
-        display_var: ctk.StringVar,
-        from_: int,
-        to: int,
-        suffix: str,
-    ) -> None:
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
-        frame.grid(row=row, column=0, padx=18, pady=8, sticky="ew")
-        frame.grid_columnconfigure(0, weight=1)
-
-        def on_change(value: float) -> None:
-            display_var.set(f"{round(value)}{suffix}")
-            self._schedule_preview_render()
-
-        ctk.CTkLabel(frame, text=label).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(frame, textvariable=display_var).grid(
-            row=0,
-            column=1,
-            sticky="e",
-        )
-        ctk.CTkSlider(
-            frame,
-            from_=from_,
-            to=to,
-            number_of_steps=to - from_,
-            variable=variable,
-            command=on_change,
-        ).grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky="ew")
-
-    def _on_selection_mode_changed(self, mode: str) -> None:
-        self._persist_current_preview_settings()
-        self.selection_mode_var.set(mode)
-        self.selection_anchor_path = None
-        self.selected_paths = ()
-        self.image_settings_by_path = {}
-        self.source_name_var.set("ยังไม่ได้เลือกรูปหรือโฟลเดอร์")
-        self.image_count_var.set(
-            "โหมดโฟลเดอร์" if mode == "folder" else "โหมดรูปเดี่ยว"
-        )
-        button_text = (
-            "เลือกโฟลเดอร์รูปภาพ"
-            if mode == "folder"
-            else "เลือกไฟล์รูปภาพ"
-        )
-        self.source_picker_button.configure(text=button_text)
-        self._update_source_picker_command()
-        self._refresh_gallery()
-        self._set_status("สลับโหมดเลือกต้นฉบับแล้ว")
-        self._schedule_preview_render(delay_ms=0)
-
-    def _on_workflow_mode_changed(self, mode: str) -> None:
-        self.workflow_mode_var.set(mode)
-        self._set_workflow_copy(mode)
-        self._update_gallery_visibility()
-        self._update_preview_layout_visibility()
-        if mode == "quick":
-            self.gallery_status_var.set(
-                "Quick mode ซ่อนรายการรูปเพื่อให้ทำงานเร็วขึ้น"
-            )
-            self._set_status("สลับเป็น Quick Batch แล้ว")
-        else:
-            self._set_status("สลับเป็น Gallery Review แล้ว")
-        self._refresh_gallery()
-        self._schedule_preview_render(delay_ms=0)
-
-    def _on_output_size_changed(self, mode: str) -> None:
-        self.output_size_var.set(mode)
-        if mode == OUTPUT_SIZE_ORIGINAL:
-            self.output_size_note_var.set("ผลลัพธ์จะคงขนาดต้นฉบับไว้")
-            self._set_status("เปลี่ยนเป็นโหมด Original Size แล้ว")
-        else:
-            self.output_size_note_var.set(
-                "ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
-            )
-            self._set_status("เปลี่ยนเป็นโหมด Resize 1280px แล้ว")
-        self._schedule_preview_render(delay_ms=0)
+    # ═══════════════════════════════════════════════════════════════════
+    # LOGO
+    # ═══════════════════════════════════════════════════════════════════
 
     def _choose_logo(self) -> None:
-        selection = filedialog.askopenfilename(
-            title="เลือกไฟล์โลโก้ PNG",
-            filetypes=(("PNG files", "*.png"), ("All files", "*.*")),
+        path_str = filedialog.askopenfilename(
+            title="เลือกไฟล์โลโก้",
+            filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
         )
-        if not selection:
+        if not path_str:
             return
+        self.logo_path = Path(path_str)
+        try:
+            img = Image.open(self.logo_path)
+            self._logo_pil = img.convert("RGBA")
+            thumb = self._logo_pil.copy()
+            thumb.thumbnail((48, 48), Image.Resampling.LANCZOS)
+            self._logo_ctk = ctk.CTkImage(
+                light_image=thumb, dark_image=thumb, size=(48, 48))
+            self.logo_thumb_label.configure(
+                image=self._logo_ctk, text="",
+                fg_color=("gray82", "gray25"))
+        except Exception:
+            self._logo_pil = None
+        self.logo_name_label.configure(text=self.logo_path.name)
+        self.logo_card.configure(border_width=2, border_color=TEAL)
+        self._update_start_button()
+        self._schedule_preview()
 
-        self.logo_path = Path(selection)
-        self.logo_name_var.set(self.logo_path.name)
-        self._invalidate_image_cache(self.logo_path)
-        self._set_status("เลือกโลโก้เรียบร้อยแล้ว")
-        self._schedule_preview_render(delay_ms=0)
+    # ═══════════════════════════════════════════════════════════════════
+    # INPUT — FILES / FOLDER
+    # ═══════════════════════════════════════════════════════════════════
 
-    def _choose_single_image(self) -> None:
-        selection = filedialog.askopenfilename(
-            title="เลือกไฟล์รูปภาพ",
-            filetypes=(
-                ("Image files", "*.jpg;*.jpeg;*.png"),
+    def _choose_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="เลือกรูปภาพ (Ctrl+click เลือกหลายไฟล์)",
+            filetypes=[
+                ("Image files", "*.jpg *.jpeg *.png"),
                 ("All files", "*.*"),
-            ),
+            ],
         )
-        if not selection:
+        if not paths:
             return
-
-        self._persist_current_preview_settings()
-        self._clear_result_preview_state()
-        selected_path = Path(selection)
-        self.selection_anchor_path = selected_path
-        self.selected_paths = (selected_path,)
-        self.preview_source_path = selected_path
-        self.image_settings_by_path = {selected_path: self._current_settings()}
-        self.source_name_var.set(str(selected_path))
-        self.image_count_var.set("เลือกรูปเดี่ยว 1 ไฟล์")
-        self.gallery_status_var.set("โหมดรูปเดี่ยว ไม่แสดง gallery หลายรูป")
-        self._apply_settings_to_controls(
-            self.image_settings_by_path[selected_path]
-        )
-        self._refresh_gallery()
-        self._set_status("เลือกไฟล์รูปภาพเรียบร้อยแล้ว")
-        self._schedule_preview_render(delay_ms=0)
+        self._merge_paths([Path(p) for p in paths])
 
     def _choose_folder(self) -> None:
-        selection = filedialog.askdirectory(title="เลือกโฟลเดอร์รูปภาพ")
-        if not selection:
+        folder_str = filedialog.askdirectory(title="เลือกโฟลเดอร์รูปภาพ")
+        if not folder_str:
+            return
+        folder = Path(folder_str)
+        new_paths = sorted(
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+        self._merge_paths(new_paths)
+
+    def _merge_paths(self, new_paths: list[Path]) -> None:
+        seen: set[Path] = {p.resolve() for p in self.image_paths}
+        for p in new_paths:
+            rp = p.resolve()
+            if (rp not in seen
+                    and rp.is_file()
+                    and rp.suffix.lower() in SUPPORTED_EXTENSIONS):
+                seen.add(rp)
+                self.image_paths.append(p)
+        self.image_paths.sort()
+        n = len(self.image_paths)
+        self.input_status_label.configure(text=f"เลือกแล้ว {n} รูป")
+        self.image_count_badge.configure(text=f"  {n} รูป  ")
+        self.image_count_badge.grid(row=0, column=1, padx=(8, 0), sticky="e")
+        if n > 0:
+            self.clear_button.grid()
+        self._update_start_button()
+        self._load_filmstrip()
+        # Auto-preview the first image if no selection yet
+        if self.image_paths and self.selected_preview_path is None:
+            self.after(300, lambda: self._on_thumb_click(self.image_paths[0]))
+
+    def _clear_images(self) -> None:
+        self.image_paths.clear()
+        self._thumb_pil_cache.clear()
+        self.selected_preview_path = None
+        self.input_status_label.configure(text="ยังไม่ได้เลือกรูปภาพ")
+        self.image_count_badge.grid_remove()
+        self.clear_button.grid_remove()
+        self._update_start_button()
+        for w in self.filmstrip_inner.winfo_children():
+            w.destroy()
+        self._thumb_labels.clear()
+        self._thumb_containers.clear()
+        self._thumb_photos.clear()
+        self.preview_canvas.delete("all")
+        self._draw_placeholder()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # FILMSTRIP
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _load_filmstrip(self) -> None:
+        for w in self.filmstrip_inner.winfo_children():
+            w.destroy()
+        self._thumb_labels.clear()
+        self._thumb_containers.clear()
+        self._thumb_photos.clear()
+
+        paths = list(self.image_paths)
+        if not paths:
             return
 
-        self._persist_current_preview_settings()
-        self._clear_result_preview_state()
-        source_folder = Path(selection)
-        images = tuple(discover_images(source_folder))
-        self.selection_anchor_path = source_folder
-        self.selected_paths = images
-        self.preview_source_path = images[0] if images else None
-        base_settings = self._current_settings()
-        self.image_settings_by_path = {
-            image_path: base_settings for image_path in images
-        }
-        self.source_name_var.set(str(source_folder))
-        self.image_count_var.set(f"พบรูปภาพ {len(images)} ไฟล์")
-        if self.preview_source_path is not None:
-            self._apply_settings_to_controls(
-                self.image_settings_by_path[self.preview_source_path]
-            )
-        self._refresh_gallery()
-        self._set_status("เลือกโฟลเดอร์เรียบร้อยแล้ว")
-        self._schedule_preview_render(delay_ms=0)
+        bg = self.filmstrip_inner.cget("bg")
+        for col, path in enumerate(paths):
+            container = tk.Frame(
+                self.filmstrip_inner, bg=bg,
+                width=THUMB_SIZE[0] + 4, height=THUMB_SIZE[1] + 4)
+            container.grid(row=0, column=col, padx=3, pady=3)
+            container.grid_propagate(False)
 
-    def _init_source_picker_command(self) -> None:
-        self._update_source_picker_command()
+            label = tk.Label(container, text="", bg=bg, cursor="hand2", relief="flat")
+            label.place(x=2, y=2, width=THUMB_SIZE[0], height=THUMB_SIZE[1])
+            label.bind("<Button-1>", lambda e, p=path: self._on_thumb_click(p))
+            label.bind("<MouseWheel>", self._filmstrip_scroll)
+            self._thumb_labels[path] = label
+            self._thumb_containers[path] = container
 
-    def _update_source_picker_command(self) -> None:
-        picker_command = (
-            self._choose_single_image
-            if self.selection_mode_var.get() == "single"
-            else self._choose_folder
-        )
-        self.source_picker_button.configure(command=picker_command)
+        threading.Thread(
+            target=self._load_thumbs_worker, args=(paths,), daemon=True).start()
 
-    def _settings_for_preview_path(self) -> PlacementSettings:
-        if self.preview_source_path is None:
-            return self._current_settings()
-        return self.image_settings_by_path.get(
-            self.preview_source_path,
-            self._current_settings(),
-        )
+    def _load_thumbs_worker(self, paths: list[Path]) -> None:
+        for path in paths:
+            if path in self._thumb_pil_cache:
+                self._events.put(("thumb_ready", path))
+                continue
+            try:
+                with Image.open(path) as img:
+                    img = (ImageOps.exif_transpose(img) or img).convert("RGB")
+                    w, h = img.size
+                    s = min(w, h)
+                    left, top = (w - s) // 2, (h - s) // 2
+                    img = img.crop((left, top, left + s, top + s))
+                    img = img.resize(THUMB_SIZE, Image.Resampling.LANCZOS)
+                    self._thumb_pil_cache[path] = img
+                self._events.put(("thumb_ready", path))
+            except Exception:
+                pass
 
-    def _persist_current_preview_settings(self) -> None:
-        if self.preview_source_path is None:
+    def _apply_thumb(self, path: Path) -> None:
+        label = self._thumb_labels.get(path)
+        pil = self._thumb_pil_cache.get(path)
+        if label is None or pil is None:
             return
-        if self.preview_source_path not in self.selected_paths:
+        photo = ImageTk.PhotoImage(pil)
+        self._thumb_photos[path] = photo
+        label.configure(image=photo, bg=self.filmstrip_inner.cget("bg"))
+
+    def _on_thumb_click(self, path: Path) -> None:
+        self.selected_preview_path = path
+        bg = self.filmstrip_inner.cget("bg")
+        for p, container in self._thumb_containers.items():
+            container.configure(bg=TEAL if p == path else bg)
+        self._render_preview(path)
+
+    def _filmstrip_scroll(self, event: tk.Event) -> None:
+        self.filmstrip_canvas.xview_scroll(
+            int(-1 * (event.delta / 120)), "units")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PREVIEW  (2-layer canvas: base + draggable logo)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _render_preview(self, path: Path) -> None:
+        if self._logo_pil is None:
             return
-        self.image_settings_by_path[self.preview_source_path] = (
-            self._current_settings()
-        )
-
-    def _apply_settings_to_controls(
-        self,
-        settings: PlacementSettings,
-    ) -> None:
-        self.landscape_position_var.set(settings.landscape_position)
-        self.portrait_position_var.set(settings.portrait_position)
-        self.output_size_var.set(settings.output_size_mode)
-        self._set_output_size_note(settings.output_size_mode)
-        self._set_offset_values(settings.offset_x, settings.offset_y)
-        self._set_logo_scale_value(settings.logo_scale_percent)
-
-    def _set_output_size_note(self, mode: str) -> None:
-        if mode == OUTPUT_SIZE_ORIGINAL:
-            self.output_size_note_var.set("ผลลัพธ์จะคงขนาดต้นฉบับไว้")
-        else:
-            self.output_size_note_var.set(
-                "ผลลัพธ์จะถูกย่อให้กว้าง 1280px"
-            )
-
-    def _select_gallery_image(self, image_path: Path) -> None:
-        if image_path == self.preview_source_path:
-            return
-        self._persist_current_preview_settings()
-        self.preview_source_path = image_path
-        self._clear_result_preview_state()
-        self._apply_settings_to_controls(
-            self.image_settings_by_path.get(
-                image_path,
-                self._current_settings(),
-            )
-        )
-        self.gallery_status_var.set(f"กำลังแก้: {image_path.name}")
-        self._refresh_gallery_selection()
-        self._schedule_preview_render(delay_ms=0)
-
-    def _refresh_gallery(self) -> None:
-        self._cancel_gallery_render()
-        for child in self.gallery_frame.winfo_children():
-            child.destroy()
-
-        self._gallery_buttons = {}
-        self._gallery_thumbnail_images = {}
-
-        if (
-            self.selection_mode_var.get() != "folder"
-            or not self.selected_paths
-        ):
-            self.gallery_status_var.set("Gallery จะแสดงเมื่อเลือกโฟลเดอร์")
-            ctk.CTkLabel(
-                self.gallery_frame,
-                text="ยังไม่มีรายการรูปในโหมดโฟลเดอร์",
-                text_color=("#6a7280", "#c4cad4"),
-            ).grid(row=0, column=0, padx=8, pady=10, sticky="w")
-            return
-
-        if self.workflow_mode_var.get() != "review":
-            self.gallery_status_var.set(
-                "Quick mode ซ่อน gallery เพื่อให้หน้าจอเรียบและลื่น"
-            )
-            ctk.CTkLabel(
-                self.gallery_frame,
-                text="สลับเป็น Review เพื่อดูและแก้ทีละรูป",
-                text_color=("#6a7280", "#c4cad4"),
-            ).grid(row=0, column=0, padx=8, pady=10, sticky="w")
-            return
-
-        current_name = (
-            self.preview_source_path.name
-            if self.preview_source_path is not None
-            else self.selected_paths[0].name
-        )
-        self.gallery_status_var.set(
-            f"เลือกดูและตั้งค่าแยกรูปได้ ตอนนี้: {current_name}"
-        )
-
-        self._gallery_render_paths = self.selected_paths
-        self._gallery_render_index = 0
-        self._render_gallery_batch()
-
-    def _cancel_gallery_render(self) -> None:
-        if self._gallery_render_after_id is not None:
-            self.after_cancel(self._gallery_render_after_id)
-            self._gallery_render_after_id = None
-        self._gallery_render_paths = ()
-        self._gallery_render_index = 0
-
-    def _render_gallery_batch(self) -> None:
-        self._gallery_render_after_id = None
-        if not self._gallery_render_paths:
-            return
-
-        start_index = self._gallery_render_index
-        end_index = min(
-            start_index + GALLERY_RENDER_BATCH_SIZE,
-            len(self._gallery_render_paths),
-        )
-        for index in range(start_index, end_index):
-            self._append_gallery_item(index, self._gallery_render_paths[index])
-
-        self._gallery_render_index = end_index
-        self._refresh_gallery_selection()
-
-        current_name = (
-            self.preview_source_path.name
-            if self.preview_source_path is not None
-            else self._gallery_render_paths[0].name
-        )
-        self.gallery_status_var.set(
-            f"เลือกดูและตั้งค่าแยกรูปได้ ตอนนี้: {current_name} "
-            f"({end_index}/{len(self._gallery_render_paths)})"
-        )
-
-        if end_index < len(self._gallery_render_paths):
-            self._gallery_render_after_id = self.after(
-                GALLERY_RENDER_DELAY_MS,
-                self._render_gallery_batch,
-            )
-            return
-
-        self._gallery_render_paths = ()
-
-    def _append_gallery_item(self, index: int, image_path: Path) -> None:
-        thumbnail = self._load_thumbnail_from_path(
-            image_path,
-            target_size=GALLERY_THUMBNAIL_SIZE,
-        )
-        ctk_image = None
-        if thumbnail is not None:
-            ctk_image = ctk.CTkImage(
-                light_image=thumbnail,
-                dark_image=thumbnail,
-                size=thumbnail.size,
-            )
-            self._gallery_thumbnail_images[image_path] = ctk_image
-
-        button = ctk.CTkButton(
-            self.gallery_frame,
-            text=image_path.name,
-            image=ctk_image,
-            compound="left",
-            anchor="w",
-            height=76,
-            command=lambda path=image_path: self._select_gallery_image(path),
-        )
-        button.grid(
-            row=index,
-            column=0,
-            padx=6,
-            pady=4,
-            sticky="ew",
-        )
-        self._gallery_buttons[image_path] = button
-
-    def _refresh_gallery_selection(self) -> None:
-        for image_path, button in self._gallery_buttons.items():
-            if image_path == self.preview_source_path:
-                button.configure(fg_color=("#1f6aa5", "#1f6aa5"))
-            else:
-                button.configure(fg_color=("#3a3a3a", "#2b2b2b"))
-
-    def _update_gallery_visibility(self) -> None:
-        show_gallery = (
-            self.selection_mode_var.get() == "folder"
-            and self.workflow_mode_var.get() == "review"
-        )
-        widgets = (
-            self.gallery_title_label,
-            self.gallery_status_label,
-            self.gallery_frame,
-        )
-        for widget in widgets:
-            if show_gallery:
-                widget.grid()
-            else:
-                widget.grid_remove()
-
-    def _update_preview_layout_visibility(self) -> None:
-        compact_preview = self.workflow_mode_var.get() == "quick"
-        logo_frame = cast(ctk.CTkFrame, self.logo_preview_label.master)
-        source_frame = cast(ctk.CTkFrame, self.source_preview_label.master)
-        result_frame = cast(ctk.CTkFrame, self.result_preview_canvas.master)
-
-        if compact_preview:
-            logo_frame.grid_remove()
-            source_frame.grid_remove()
-            result_frame.grid_configure(column=0, columnspan=3)
-            self.preview_title_label.configure(text="Quick Preview")
-            return
-
-        logo_frame.grid()
-        source_frame.grid()
-        result_frame.grid_configure(column=2, columnspan=1)
-        self.preview_title_label.configure(text="Preview")
-
-    def _set_workflow_copy(self, mode: str) -> None:
-        if mode == "quick":
-            self.workflow_note_var.set(
-                "Quick: หน้าจอเรียบ ใช้ Result preview เป็นหลัก"
-            )
-        else:
-            self.workflow_note_var.set(
-                "Review: เปิด gallery เพื่อแก้แยกรูปทีละใบ"
-            )
-
-    def _current_settings(self) -> PlacementSettings:
-        return PlacementSettings(
-            landscape_position=self.landscape_position_var.get(),
-            portrait_position=self.portrait_position_var.get(),
-            output_size_mode=self.output_size_var.get(),
-            offset_x=self.offset_x_var.get(),
-            offset_y=self.offset_y_var.get(),
-            logo_scale_percent=self.logo_scale_var.get(),
-        )
-
-    def _update_position_hint(self) -> None:
-        default_hint = (
-            "Landscape ใช้กับรูปแนวนอน, "
-            "Portrait / Square ใช้กับรูปแนวตั้งหรือจัตุรัส"
-        )
-        if self.preview_source_path is None:
-            self.position_hint_var.set(default_hint)
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            # Canvas not laid out yet — retry after layout pass
+            self.after(150, lambda: self._render_preview(path))
             return
 
         try:
-            source_image = self._get_cached_scene_image(
-                self.preview_source_path
-            )
-        except OSError:
-            self.position_hint_var.set(default_hint)
-            return
+            with Image.open(path) as raw:
+                raw = (ImageOps.exif_transpose(raw) or raw).convert("RGBA")
 
-        oriented_image = ImageOps.exif_transpose(source_image) or source_image
-        if oriented_image.width > oriented_image.height:
-            self.position_hint_var.set(
-                "รูปปัจจุบัน: Landscape. ตอนนี้ dropdown Landscape มีผลทันที"
-            )
-            return
+            # Resize base to TARGET_WIDTH
+            if raw.width != TARGET_WIDTH:
+                new_h = round(TARGET_WIDTH / raw.width * raw.height)
+                base = raw.resize((TARGET_WIDTH, new_h), Image.Resampling.LANCZOS)
+            else:
+                base = raw.copy()
+            base_w, base_h = base.size
 
-        self.position_hint_var.set(
-            "รูปปัจจุบัน: Portrait / Square. "
-            "ตอนนี้ dropdown Portrait / Square มีผลทันที"
+            # Prepare logo at full resolution
+            logo_w = max(1, round(base_w * self.logo_scale_var.get() / 100))
+            logo_h = max(1, round(logo_w * self._logo_pil.height / self._logo_pil.width))
+            logo_resized = self._logo_pil.resize(
+                (logo_w, logo_h), Image.Resampling.LANCZOS)
+
+            # Compute logo position in full-res image coords
+            if self._logo_pos_ratio is not None:
+                lx = max(0, min(
+                    round(self._logo_pos_ratio[0] * base_w), base_w - logo_w))
+                ly = max(0, min(
+                    round(self._logo_pos_ratio[1] * base_h), base_h - logo_h))
+            else:
+                pos_key = THAI_TO_POSITION.get(
+                    self.position_thai_var.get(), "bottom-right")
+                lx, ly = calculate_position(
+                    base.size, (logo_w, logo_h), pos_key, 0, 0, 0)
+
+            # Scale base to fit canvas
+            preview_base = base.convert("RGB")
+            preview_base.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+            pw, ph = preview_base.size
+            scale = pw / base_w
+
+            # Center image on canvas
+            ox = (cw - pw) // 2
+            oy = (ch - ph) // 2
+
+            # Scale logo for canvas display
+            clw = max(1, round(logo_w * scale))
+            clh = max(1, round(logo_h * scale))
+            canvas_logo = logo_resized.resize(
+                (clw, clh), Image.Resampling.LANCZOS)
+            clx = ox + round(lx * scale)
+            cly = oy + round(ly * scale)
+
+            # Store values for drag coordinate mapping
+            self._prev_scale = scale
+            self._prev_img_offset = (ox, oy)
+            self._prev_base_size = (base_w, base_h)
+            self._prev_logo_size_canvas = (clw, clh)
+
+            self._preview_base_photo = ImageTk.PhotoImage(preview_base)
+            self._preview_logo_photo = ImageTk.PhotoImage(canvas_logo)
+
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(
+                ox, oy, image=self._preview_base_photo,
+                anchor="nw", tags="base")
+            self._canvas_logo_id = self.preview_canvas.create_image(
+                clx, cly, image=self._preview_logo_photo,
+                anchor="nw", tags="logo")
+
+            self.preview_canvas.tag_bind(
+                "logo", "<ButtonPress-1>", self._on_logo_drag_start)
+            self.preview_canvas.tag_bind(
+                "logo", "<B1-Motion>", self._on_logo_drag_motion)
+            self.preview_canvas.tag_bind(
+                "logo", "<Enter>",
+                lambda e: self.preview_canvas.configure(cursor="fleur"))
+            self.preview_canvas.tag_bind(
+                "logo", "<Leave>",
+                lambda e: self.preview_canvas.configure(cursor=""))
+
+        except Exception as exc:
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_text(
+                self.preview_canvas.winfo_width() // 2,
+                self.preview_canvas.winfo_height() // 2,
+                text=f"⚠️ ไม่สามารถแสดง preview ได้\n{exc}",
+                fill="#e05555", font=("Helvetica", 12), justify="center",
+            )
+
+    def _schedule_preview(self) -> None:
+        if self._preview_debounce_id:
+            self.after_cancel(self._preview_debounce_id)
+        self._preview_debounce_id = self.after(
+            PREVIEW_DEBOUNCE_MS,
+            lambda: (
+                self._render_preview(self.selected_preview_path)
+                if self.selected_preview_path else None
+            ),
         )
 
-    def _build_request(self) -> BatchRequest | None:
-        self._persist_current_preview_settings()
-        if self.logo_path is None:
-            return None
-        if not self.selected_paths:
-            return None
+    def _on_preview_resize(self, _event: tk.Event) -> None:
+        if self.selected_preview_path:
+            self._schedule_preview()
+        else:
+            self._draw_placeholder()
 
-        anchor_path = self.selection_anchor_path or self.selected_paths[0]
-        return BatchRequest(
-            logo_path=self.logo_path,
-            settings=self._current_settings(),
-            source_folder=anchor_path if anchor_path.is_dir() else None,
-            source_paths=self.selected_paths,
-            output_folder=get_output_folder(anchor_path),
-            settings_by_path=dict(self.image_settings_by_path),
+    # ═══════════════════════════════════════════════════════════════════
+    # DRAG  — move logo freely on the canvas
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _on_canvas_scroll(self, event: tk.Event) -> None:
+        """Canvas-level scroll — resize logo only when cursor is over it."""
+        items = self.preview_canvas.find_overlapping(
+            event.x, event.y, event.x, event.y)
+        if self._canvas_logo_id is not None and self._canvas_logo_id in items:
+            self._on_logo_scroll(event)
+
+    def _on_logo_scroll(self, event: tk.Event) -> None:
+        """Mouse wheel over logo → resize by ±1% per notch."""
+        delta = 1 if event.delta > 0 else -1
+        new_val = max(5, min(40, self.logo_scale_var.get() + delta))
+        self.logo_scale_var.set(new_val)
+        self.scale_display_var.set(f"{new_val}%")
+        self._schedule_preview()
+
+    def _on_logo_drag_start(self, event: tk.Event) -> None:
+        self._drag_start_evt = (event.x, event.y)
+        if self._canvas_logo_id is not None:
+            coords = self.preview_canvas.coords(self._canvas_logo_id)
+            if coords:
+                self._drag_start_logo_canvas = (coords[0], coords[1])
+
+    def _on_logo_drag_motion(self, event: tk.Event) -> None:
+        if (self._drag_start_evt is None
+                or self._drag_start_logo_canvas is None
+                or self._canvas_logo_id is None):
+            return
+
+        dx = event.x - self._drag_start_evt[0]
+        dy = event.y - self._drag_start_evt[1]
+        new_cx = self._drag_start_logo_canvas[0] + dx
+        new_cy = self._drag_start_logo_canvas[1] + dy
+
+        ox, oy = self._prev_img_offset
+        scale = self._prev_scale
+        bw, bh = self._prev_base_size
+        clw, clh = self._prev_logo_size_canvas
+        canvas_bw = round(bw * scale)
+        canvas_bh = round(bh * scale)
+
+        new_cx = max(float(ox), min(new_cx, float(ox + canvas_bw - clw)))
+        new_cy = max(float(oy), min(new_cy, float(oy + canvas_bh - clh)))
+
+        # Move logo instantly — no re-render
+        self.preview_canvas.coords(self._canvas_logo_id, new_cx, new_cy)
+
+        # Store as ratio of full-res image
+        self._logo_pos_ratio = (
+            (new_cx - ox) / (bw * scale),
+            (new_cy - oy) / (bh * scale),
         )
+
+        # Show indicator
+        self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
+        self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # SETTINGS HELPERS
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _on_output_size_changed(self, _: str) -> None:
+        self._schedule_preview()
+
+    def _on_position_changed(self, _: str) -> None:
+        self._logo_pos_ratio = None
+        self.custom_pos_label.grid_remove()
+        self.reset_pos_button.grid_remove()
+        self._schedule_preview()
+
+    def _reset_logo_position(self) -> None:
+        self._logo_pos_ratio = None
+        self.custom_pos_label.grid_remove()
+        self.reset_pos_button.grid_remove()
+        self._schedule_preview()
+
+    def _on_scale_changed(self, value: float) -> None:
+        self.scale_display_var.set(f"{int(value)}%")
+        self._schedule_preview()
+
+    def _get_settings(self) -> PlacementSettings:
+        pos = THAI_TO_POSITION.get(self.position_thai_var.get(), "bottom-right")
+        return PlacementSettings(
+            landscape_position=pos,
+            portrait_position=pos,
+            output_size_mode=self.output_size_var.get(),
+            logo_scale_percent=self.logo_scale_var.get(),
+            margin=0,
+        )
+
+    def _build_settings_by_path(self) -> dict[Path, PlacementSettings]:
+        """Per-image settings when logo was dragged to a custom position."""
+        if self._logo_pos_ratio is None or self._logo_pil is None:
+            return {}
+
+        ratio_x, ratio_y = self._logo_pos_ratio
+        scale_pct = self.logo_scale_var.get()
+        result: dict[Path, PlacementSettings] = {}
+
+        for path in self.image_paths:
+            try:
+                with Image.open(path) as img:
+                    orig_w, orig_h = img.size
+                out_w = TARGET_WIDTH
+                out_h = round(TARGET_WIDTH / orig_w * orig_h)
+                logo_w = max(1, round(out_w * scale_pct / 100))
+                logo_h = max(1, round(
+                    logo_w * self._logo_pil.height / self._logo_pil.width))
+                logo_x = max(0, min(round(ratio_x * out_w), out_w - logo_w))
+                logo_y = max(0, min(round(ratio_y * out_h), out_h - logo_h))
+                result[path] = PlacementSettings(
+                    landscape_position="top-left",
+                    portrait_position="top-left",
+                    margin=0,
+                    offset_x=logo_x,
+                    offset_y=logo_y,
+                    logo_scale_percent=scale_pct,
+                )
+            except Exception:
+                pass
+        return result
+
+    def _update_start_button(self) -> None:
+        if self.logo_path and self.image_paths:
+            self.start_button.configure(state="normal")
+        else:
+            self.start_button.configure(state="disabled")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PROCESSING
+    # ═══════════════════════════════════════════════════════════════════
 
     def _start_processing(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
+        if not self.logo_path or not self.image_paths:
+            return
+        if self._worker and self._worker.is_alive():
             return
 
-        request = self._build_request()
-        if request is None:
-            if self.logo_path is None:
-                messagebox.showwarning(
-                    "ยังไม่พร้อม",
-                    "กรุณาเลือกไฟล์โลโก้ PNG ก่อนเริ่มงาน",
-                )
-                return
-            messagebox.showwarning(
-                "ยังไม่พร้อม",
-                "กรุณาเลือกไฟล์รูปภาพหรือโฟลเดอร์ก่อนเริ่มงาน",
-            )
-            return
+        self.start_button.configure(state="disabled", text="กำลังประมวลผล...")
+        self.progress_frame.grid()
+        self.progress_bar.set(0)
+        self.status_var.set("กำลังเริ่มต้น...")
 
-        if not request.source_paths:
-            messagebox.showwarning(
-                "ไม่พบรูปภาพ",
-                "รายการที่เลือกยังไม่มีไฟล์ .jpg, .jpeg หรือ .png",
-            )
-            return
-
-        total_files = len(request.source_paths)
-        self.progress_var.set(0)
-        self.open_output_button.configure(state="disabled")
-        self.start_button.configure(state="disabled")
-        self._set_status(f"Processing... 0/{total_files}")
-
-        def run_worker() -> None:
-            try:
-                results = process_batch(
-                    request,
-                    progress_callback=self._push_progress,
-                )
-                self._events.put(("done", results))
-            except Exception as exc:  # noqa: BLE001
-                self._events.put(("error", str(exc)))
-
-        self._worker = threading.Thread(target=run_worker, daemon=True)
+        request = BatchRequest(
+            logo_path=self.logo_path,
+            settings=self._get_settings(),
+            source_paths=tuple(self.image_paths),
+            settings_by_path=self._build_settings_by_path(),
+        )
+        self._worker = threading.Thread(
+            target=self._worker_fn, args=(request,), daemon=True)
         self._worker.start()
 
-    def _push_progress(
-        self,
-        index: int,
-        total: int,
-        current_path: Path,
-    ) -> None:
-        self._events.put(("progress", (index, total, current_path.name)))
+    def _worker_fn(self, request: BatchRequest) -> None:
+        def on_progress(current: int, total: int, path: Path) -> None:
+            self._events.put(("progress", (current, total, path.name)))
+
+        try:
+            results = process_batch(request, progress_callback=on_progress)
+            folder = results[0].output_path.parent if results else None
+            self._events.put(("done", folder))
+        except Exception as exc:
+            self._events.put(("error", str(exc)))
 
     def _poll_events(self) -> None:
         try:
             while True:
-                event_name, payload = self._events.get_nowait()
-                if event_name == "progress":
-                    index, total, file_name = cast(ProgressPayload, payload)
-                    self.progress_var.set(index / total)
-                    self._set_status(
-                        f"Processing... {index}/{total} - {file_name}"
-                    )
-                elif event_name == "done":
-                    self._handle_done(cast(list[ProcessedFile], payload))
-                elif event_name == "error":
-                    self._handle_error(cast(str, payload))
+                event, payload = self._events.get_nowait()
+                if event == "progress":
+                    cur, total, name = payload  # type: ignore[misc]
+                    self.progress_var.set(cur / total)
+                    self.status_var.set(f"กำลังทำ {cur} / {total}  —  {name}")
+                elif event == "done":
+                    self.last_output_folder = payload  # type: ignore[assignment]
+                    self._on_done()
+                elif event == "error":
+                    messagebox.showerror("เกิดข้อผิดพลาด", str(payload))
+                    self.start_button.configure(
+                        state="normal", text="▶  START เริ่มประมวลผล")
+                elif event == "thumb_ready":
+                    self._apply_thumb(payload)  # type: ignore[arg-type]
         except queue.Empty:
             pass
-        finally:
-            self._poll_events_after_id = self.after(120, self._poll_events)
+        self.after(80, self._poll_events)
 
-    def destroy(self) -> None:
-        callback_ids = (
-            self._preview_render_after_id,
-            self._gallery_render_after_id,
-            self._poll_events_after_id,
-        )
-        for callback_id in callback_ids:
-            if callback_id is None:
-                continue
-            try:
-                self.after_cancel(callback_id)
-            except tk.TclError:
-                pass
-        super().destroy()
-
-    def _handle_done(self, results: list[ProcessedFile]) -> None:
-        self.progress_var.set(1)
-        self.start_button.configure(state="normal")
-        self.last_output_folder = (
-            results[0].output_path.parent if results else None
-        )
-        if self.last_output_folder is not None:
-            self.open_output_button.configure(state="normal")
-
-        success_count = len(results)
-        self._set_status(f"เสร็จสิ้น! ประมวลผลครบ {success_count} ไฟล์")
+    def _on_done(self) -> None:
+        self.progress_bar.set(1.0)
+        self.status_var.set(f"เสร็จสิ้น ✓  ({len(self.image_paths)} รูป)")
+        self.start_button.configure(state="normal", text="▶  START ใหม่อีกครั้ง")
+        self.open_folder_button.grid(row=1, column=0, pady=(8, 0), sticky="ew")
         messagebox.showinfo(
             "เสร็จสิ้น",
-            "ประมวลผลรูปภาพเรียบร้อยแล้ว "
-            f"{success_count} ไฟล์\n"
-            "ผลลัพธ์ถูกบันทึกไว้ที่:\n"
-            f"{self.last_output_folder}",
-        )
-        self._schedule_preview_render(delay_ms=0)
-
-    def _handle_error(self, message: str) -> None:
-        self.start_button.configure(state="normal")
-        self.progress_var.set(0)
-        self._set_status("เกิดข้อผิดพลาดระหว่างประมวลผล")
-        messagebox.showerror("เกิดข้อผิดพลาด", message)
-
-    def _set_status(self, message: str) -> None:
-        self.status_var.set(message)
-
-    def _schedule_preview_render(
-        self,
-        delay_ms: int = PREVIEW_RENDER_DELAY_MS,
-    ) -> None:
-        if self._preview_render_after_id is not None:
-            self.after_cancel(self._preview_render_after_id)
-            self._preview_render_after_id = None
-
-        if delay_ms <= 0:
-            self._render_previews()
-            return
-
-        self._preview_render_after_id = self.after(
-            delay_ms,
-            self._render_previews,
+            f"ประมวลผลรูปภาพเรียบร้อยแล้ว {len(self.image_paths)} รูป\n\n"
+            f"บันทึกไปที่:\n{self.last_output_folder}",
         )
 
-    def _render_previews(self) -> None:
-        self._preview_render_after_id = None
-        self._persist_current_preview_settings()
-        self._update_position_hint()
-        if self.workflow_mode_var.get() == "review":
-            self._set_preview_image(
-                self.logo_preview_label,
-                self._load_logo_preview(),
-                "_logo_preview_image",
-                "ยังไม่มีโลโก้",
-            )
-            self._set_preview_image(
-                self.source_preview_label,
-                self._load_source_preview(),
-                "_source_preview_image",
-                "ยังไม่มีรูปต้นฉบับ",
-            )
-        else:
-            self._set_preview_image(
-                self.logo_preview_label,
-                None,
-                "_logo_preview_image",
-                "ยังไม่มีโลโก้",
-            )
-            self._set_preview_image(
-                self.source_preview_label,
-                None,
-                "_source_preview_image",
-                "ยังไม่มีรูปต้นฉบับ",
-            )
-        self._refresh_gallery_selection()
-        self._render_result_preview()
-
-    def _load_logo_preview(self) -> Image.Image | None:
-        if self.logo_path is None:
-            return None
-        return self._load_thumbnail_from_path(
-            self.logo_path,
-            keep_alpha=True,
-            target_size=LOGO_PREVIEW_SIZE,
-        )
-
-    def _load_source_preview(self) -> Image.Image | None:
-        if self.preview_source_path is None:
-            return None
-        return self._load_thumbnail_from_path(
-            self.preview_source_path,
-            target_size=SOURCE_PREVIEW_SIZE,
-        )
-
-    def _load_result_scene(self):
-        if self.logo_path is None or self.preview_source_path is None:
-            return None
-
-        try:
-            source_image = self._get_cached_scene_image(
-                self.preview_source_path,
-            )
-            logo_image = self._get_cached_scene_image(self.logo_path)
-            return build_watermark_scene(
-                source_image,
-                logo_image,
-                self._settings_for_preview_path(),
-                preview=True,
-            )
-        except OSError:
-            return None
-
-    def _render_result_preview(self) -> None:
-        canvas = self.result_preview_canvas
-        canvas.delete("all")
-
-        scene = self._load_result_scene()
-        if scene is None:
-            self._clear_result_preview_state()
-            self._result_preview_base_image = None
-            self._result_preview_logo_image = None
-            self._result_preview_logo_bbox = None
-            canvas.create_text(
-                RESULT_CANVAS_SIZE[0] / 2,
-                RESULT_CANVAS_SIZE[1] / 2,
-                text="ยังไม่มีผลลัพธ์ preview",
-                fill="#c4cad4",
-                font=("Segoe UI", 14),
-            )
-            return
-
-        canvas_width = max(canvas.winfo_width(), RESULT_CANVAS_SIZE[0])
-        canvas_height = max(canvas.winfo_height(), RESULT_CANVAS_SIZE[1])
-        origin_x = round((canvas_width - scene.base_image.width) / 2)
-        origin_y = round((canvas_height - scene.base_image.height) / 2)
-
-        base_image = scene.base_image.copy()
-        logo_image = scene.logo_image.copy()
-        self._result_preview_base_image = ImageTk.PhotoImage(base_image)
-        self._result_preview_logo_image = ImageTk.PhotoImage(logo_image)
-        canvas.create_image(
-            origin_x,
-            origin_y,
-            anchor=tk.NW,
-            image=self._result_preview_base_image,
-        )
-
-        logo_x = origin_x + scene.position[0]
-        logo_y = origin_y + scene.position[1]
-        canvas.create_image(
-            logo_x,
-            logo_y,
-            anchor=tk.NW,
-            image=self._result_preview_logo_image,
-        )
-
-        bbox = (
-            logo_x,
-            logo_y,
-            logo_x + logo_image.width,
-            logo_y + logo_image.height,
-        )
-        self._result_preview_logo_bbox = bbox
-        self._result_preview_anchor_position = (
-            scene.position[0] - self._settings_for_preview_path().offset_x,
-            scene.position[1] - self._settings_for_preview_path().offset_y,
-        )
-        canvas.create_rectangle(
-            bbox[0],
-            bbox[1],
-            bbox[2],
-            bbox[3],
-            outline="#3b8edb",
-            width=2,
-            dash=(4, 3),
-        )
-
-    def _point_in_logo_preview(self, x: int, y: int) -> bool:
-        if self._result_preview_logo_bbox is None:
-            return False
-        left, top, right, bottom = self._result_preview_logo_bbox
-        return left <= x <= right and top <= y <= bottom
-
-    def _on_result_preview_motion(self, event: tk.Event) -> None:
-        cursor = (
-            "fleur"
-            if self._point_in_logo_preview(event.x, event.y)
-            else "arrow"
-        )
-        self.result_preview_canvas.configure(cursor=cursor)
-
-    def _on_result_preview_press(self, event: tk.Event) -> None:
-        if not self._point_in_logo_preview(event.x, event.y):
-            self._result_preview_drag_origin = None
-            self._result_preview_drag_position = None
-            return
-
-        self._result_preview_drag_origin = (event.x, event.y)
-        current_scene = self._load_result_scene()
-        if current_scene is None:
-            self._result_preview_drag_position = None
-            return
-        self._result_preview_drag_position = current_scene.position
-
-    def _on_result_preview_drag(self, event: tk.Event) -> None:
-        if (
-            self._result_preview_drag_origin is None
-            or self._result_preview_drag_position is None
-            or self._result_preview_anchor_position is None
-        ):
-            return
-
-        current_scene = self._load_result_scene()
-        if current_scene is None:
-            return
-
-        dx = event.x - self._result_preview_drag_origin[0]
-        dy = event.y - self._result_preview_drag_origin[1]
-        desired_x = self._result_preview_drag_position[0] + dx
-        desired_y = self._result_preview_drag_position[1] + dy
-
-        anchor_x, anchor_y = self._result_preview_anchor_position
-        min_offset_x = -anchor_x
-        max_offset_x = (
-            current_scene.base_image.width
-            - current_scene.logo_image.width
-            - anchor_x
-        )
-        min_offset_y = -anchor_y
-        max_offset_y = (
-            current_scene.base_image.height
-            - current_scene.logo_image.height
-            - anchor_y
-        )
-        offset_x = max(
-            min_offset_x,
-            min(desired_x - anchor_x, max_offset_x),
-        )
-        offset_y = max(
-            min_offset_y,
-            min(desired_y - anchor_y, max_offset_y),
-        )
-        self._set_offset_values(round(offset_x), round(offset_y))
-        self._schedule_preview_render()
-
-    def _on_result_preview_release(self, _event: tk.Event) -> None:
-        self._result_preview_drag_origin = None
-        self._result_preview_drag_position = None
-
-    def _on_result_preview_wheel(self, event: tk.Event) -> None:
-        if not self._point_in_logo_preview(event.x, event.y):
-            return
-
-        current_value = self.logo_scale_var.get()
-        step = 1 if event.delta > 0 else -1
-        self._set_logo_scale_value(current_value + step)
-        self._schedule_preview_render()
-
-    def _get_cached_thumbnail(
-        self,
-        image_path: Path,
-        keep_alpha: bool,
-        target_size: tuple[int, int],
-    ) -> Image.Image | None:
-        try:
-            cache_key = (image_path, keep_alpha, target_size)
-            mtime_ns = image_path.stat().st_mtime_ns
-            cached_entry = self._thumbnail_cache.get(cache_key)
-            if cached_entry is not None and cached_entry[0] == mtime_ns:
-                return cached_entry[1].copy()
-
-            with Image.open(image_path) as image:
-                preview_image = image.copy()
-        except OSError:
-            return None
-
-        if keep_alpha:
-            preview_image = create_preview_base(preview_image)
-
-        thumbnail = self._thumbnail_image(
-            preview_image,
-            target_size=target_size,
-        )
-        self._thumbnail_cache[cache_key] = (mtime_ns, thumbnail.copy())
-        return thumbnail
-
-    def _get_cached_scene_image(self, image_path: Path) -> Image.Image:
-        mtime_ns = image_path.stat().st_mtime_ns
-        cached_entry = self._scene_image_cache.get(image_path)
-        if cached_entry is not None and cached_entry[0] == mtime_ns:
-            return cached_entry[1].copy()
-
-        with Image.open(image_path) as image:
-            scene_image = image.copy()
-
-        self._scene_image_cache[image_path] = (mtime_ns, scene_image.copy())
-        return scene_image
-
-    def _invalidate_image_cache(self, image_path: Path | None) -> None:
-        if image_path is None:
-            return
-
-        self._scene_image_cache.pop(image_path, None)
-        thumbnail_keys = [
-            key for key in self._thumbnail_cache if key[0] == image_path
-        ]
-        for key in thumbnail_keys:
-            self._thumbnail_cache.pop(key, None)
-
-    def _load_thumbnail_from_path(
-        self,
-        image_path: Path,
-        keep_alpha: bool = False,
-        target_size: tuple[int, int] = PREVIEW_IMAGE_SIZE,
-    ) -> Image.Image | None:
-        return self._get_cached_thumbnail(
-            image_path,
-            keep_alpha=keep_alpha,
-            target_size=target_size,
-        )
-
-    def _thumbnail_image(
-        self,
-        image: Image.Image,
-        target_size: tuple[int, int] = PREVIEW_IMAGE_SIZE,
-    ) -> Image.Image:
-        thumbnail = image.copy()
-        thumbnail.thumbnail(target_size, Image.Resampling.LANCZOS)
-        return thumbnail
-
-    def _set_offset_values(self, offset_x: int, offset_y: int) -> None:
-        self.offset_x_var.set(offset_x)
-        self.offset_y_var.set(offset_y)
-        self.offset_x_value_var.set(f"{offset_x} px")
-        self.offset_y_value_var.set(f"{offset_y} px")
-
-    def _set_logo_scale_value(self, value: int) -> None:
-        clamped_value = max(5, min(value, 40))
-        self.logo_scale_var.set(clamped_value)
-        self.scale_value_var.set(f"{clamped_value}%")
-
-    def _clear_result_preview_state(self) -> None:
-        self._result_preview_logo_bbox = None
-        self._result_preview_anchor_position = None
-        self._result_preview_drag_origin = None
-        self._result_preview_drag_position = None
-
-    def _set_preview_image(
-        self,
-        widget: ctk.CTkLabel,
-        image: Image.Image | None,
-        cache_attr: str,
-        placeholder: str,
-    ) -> None:
-        previous_image = getattr(self, cache_attr, None)
-        if image is None:
-            widget.configure(image=None, text=placeholder)
-            setattr(self, cache_attr, None)
-            return
-
-        ctk_image = ctk.CTkImage(
-            light_image=image,
-            dark_image=image,
-            size=image.size,
-        )
-        widget.configure(image=ctk_image, text="")
-        setattr(self, cache_attr, ctk_image)
-        _ = previous_image
+    def _on_logo_drag(self, event) -> None:
+        pass
 
     def _open_output_folder(self) -> None:
-        if (
-            self.last_output_folder is None
-            or not self.last_output_folder.exists()
-        ):
-            messagebox.showwarning(
-                "ยังไม่พบผลลัพธ์",
-                "ยังไม่มีโฟลเดอร์ผลลัพธ์ให้เปิด",
-            )
-            return
-
-        os.startfile(self.last_output_folder)
+        if self.last_output_folder and self.last_output_folder.exists():
+            os.startfile(str(self.last_output_folder))
