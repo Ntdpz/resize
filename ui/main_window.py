@@ -75,6 +75,8 @@ class AutoWatermarkWindow(ctk.CTk):
 
         # ── Drag / free-position state ─────────────────────────────────
         self._canvas_logo_id: int | None = None
+        self._canvas_handle_id: int | None = None   # resize handle circle
+        self._canvas_selection_id: int | None = None  # dashed border
         # Ratio (0.0–1.0) of full-res image; None = use preset
         self._logo_pos_ratio: tuple[float, float] | None = None
         self._drag_start_evt: tuple[int, int] | None = None
@@ -83,6 +85,11 @@ class AutoWatermarkWindow(ctk.CTk):
         self._prev_img_offset: tuple[int, int] = (0, 0)
         self._prev_base_size: tuple[int, int] = (TARGET_WIDTH, 720)
         self._prev_logo_size_canvas: tuple[int, int] = (0, 0)
+        # Resize-handle drag state
+        self._resize_dragging: bool = False
+        self._resize_start_evt: tuple[int, int] | None = None
+        self._resize_start_scale: int = 18   # logo_scale_var value at drag start
+        self._resize_start_logo_w_canvas: int = 0   # canvas-px logo width at drag start
 
         # ── UI variables ───────────────────────────────────────────────
         self.position_thai_var = ctk.StringVar(value=POSITION_THAI["top-right"])
@@ -654,6 +661,21 @@ class AutoWatermarkWindow(ctk.CTk):
                 clx, cly, image=self._preview_logo_photo,
                 anchor="nw", tags="logo")
 
+            # ── Selection border (dashed) around logo ──
+            self._canvas_selection_id = self.preview_canvas.create_rectangle(
+                clx, cly, clx + clw, cly + clh,
+                outline=TEAL, width=2, dash=(6, 4), fill="",
+                tags="selection",
+            )
+            # ── Resize handle: circle at bottom-right corner ──
+            HR = 8  # radius
+            self._canvas_handle_id = self.preview_canvas.create_oval(
+                clx + clw - HR, cly + clh - HR,
+                clx + clw + HR, cly + clh + HR,
+                fill="white", outline=TEAL, width=2,
+                tags="handle",
+            )
+
             self.preview_canvas.tag_bind(
                 "logo", "<ButtonPress-1>", self._on_logo_drag_start)
             self.preview_canvas.tag_bind(
@@ -663,6 +685,18 @@ class AutoWatermarkWindow(ctk.CTk):
                 lambda e: self.preview_canvas.configure(cursor="fleur"))
             self.preview_canvas.tag_bind(
                 "logo", "<Leave>",
+                lambda e: self.preview_canvas.configure(cursor=""))
+            self.preview_canvas.tag_bind(
+                "handle", "<ButtonPress-1>", self._on_handle_drag_start)
+            self.preview_canvas.tag_bind(
+                "handle", "<B1-Motion>", self._on_handle_drag_motion)
+            self.preview_canvas.tag_bind(
+                "handle", "<ButtonRelease-1>", self._on_handle_drag_end)
+            self.preview_canvas.tag_bind(
+                "handle", "<Enter>",
+                lambda e: self.preview_canvas.configure(cursor="size_nw_se"))
+            self.preview_canvas.tag_bind(
+                "handle", "<Leave>",
                 lambda e: self.preview_canvas.configure(cursor=""))
 
         except Exception as exc:
@@ -710,6 +744,8 @@ class AutoWatermarkWindow(ctk.CTk):
         self.scale_display_var.set(f"{new_val}%")
         self._schedule_preview()
 
+    # ── Move drag ──────────────────────────────────────────────────────────────
+
     def _on_logo_drag_start(self, event: tk.Event) -> None:
         self._drag_start_evt = (event.x, event.y)
         if self._canvas_logo_id is not None:
@@ -750,6 +786,72 @@ class AutoWatermarkWindow(ctk.CTk):
         # Show indicator
         self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
         self.reset_pos_button.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+        # Keep handle in sync with new logo position
+        self._update_handle_pos()
+
+    def _update_handle_pos(self) -> None:
+        """Move selection border and resize handle to match current logo on canvas."""
+        if self._canvas_logo_id is None or self._canvas_handle_id is None:
+            return
+        coords = self.preview_canvas.coords(self._canvas_logo_id)
+        if not coords:
+            return
+        clx, cly = coords[0], coords[1]
+        clw, clh = self._prev_logo_size_canvas
+        HR = 8
+        # Selection border
+        if hasattr(self, '_canvas_selection_id') and self._canvas_selection_id:
+            self.preview_canvas.coords(
+                self._canvas_selection_id,
+                clx, cly, clx + clw, cly + clh)
+        # Circle handle
+        self.preview_canvas.coords(
+            self._canvas_handle_id,
+            clx + clw - HR, cly + clh - HR,
+            clx + clw + HR, cly + clh + HR,
+        )
+
+    # ── Resize drag ──────────────────────────────────────────────────────────
+
+    def _on_handle_drag_start(self, event: tk.Event) -> None:
+        self._resize_dragging = True
+        self._resize_start_evt = (event.x, event.y)
+        self._resize_start_scale = self.logo_scale_var.get()
+        self._resize_start_logo_w_canvas = self._prev_logo_size_canvas[0]
+
+    def _on_handle_drag_motion(self, event: tk.Event) -> None:
+        if not self._resize_dragging or self._resize_start_evt is None:
+            return
+        dx = event.x - self._resize_start_evt[0]
+        dy = event.y - self._resize_start_evt[1]
+        diag = (dx + dy) / 2
+        if self._resize_start_logo_w_canvas <= 0:
+            return
+        factor = (self._resize_start_logo_w_canvas + diag) / self._resize_start_logo_w_canvas
+        new_val = max(5, min(40, round(self._resize_start_scale * factor)))
+        if new_val == self.logo_scale_var.get():
+            return  # no change, skip
+        self.logo_scale_var.set(new_val)
+        self.scale_display_var.set(f"{new_val}%")
+
+        # ── Live resize: update canvas image directly, no full re-render ──
+        if self._logo_pil is not None and self._canvas_logo_id is not None:
+            bw, _ = self._prev_base_size
+            logo_w = max(1, round(bw * new_val / 100))
+            logo_h = max(1, round(logo_w * self._logo_pil.height / self._logo_pil.width))
+            clw = max(1, round(logo_w * self._prev_scale))
+            clh = max(1, round(logo_h * self._prev_scale))
+            live_logo = self._logo_pil.resize((clw, clh), Image.Resampling.BILINEAR)
+            self._preview_logo_photo = ImageTk.PhotoImage(live_logo)
+            self.preview_canvas.itemconfig(
+                self._canvas_logo_id, image=self._preview_logo_photo)
+            self._prev_logo_size_canvas = (clw, clh)
+            self._update_handle_pos()
+
+    def _on_handle_drag_end(self, event: tk.Event) -> None:
+        self._resize_dragging = False
+        # Full quality re-render after drag ends
+        self._schedule_preview()
 
     # ═══════════════════════════════════════════════════════════════════
     # SETTINGS HELPERS
