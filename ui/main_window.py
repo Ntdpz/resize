@@ -48,6 +48,9 @@ POSITION_THAI: dict[str, str] = {
 }
 THAI_TO_POSITION: dict[str, str] = {v: k for k, v in POSITION_THAI.items()}
 
+# Gap (px at 1280-wide reference) between logos in the auto-arrange queue
+_QUEUE_GAP: int = 8
+
 
 if _DND_AVAILABLE:
     class _DndBase(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore[misc]
@@ -83,6 +86,7 @@ class AutoWatermarkWindow(_DndBase):
         self._logo_portrait_scales: list[int] = []
         self._logo_positions: list[str] = []   # Thai display string
         self._logo_opacities: list[float] = []
+        self._logo_offset_x: list[int] = []    # horizontal queue offset (px)
         self._logo_list_rows: list[ctk.CTkFrame] = []  # UI row frames
 
         # ── Threading ──────────────────────────────────────────────────
@@ -655,12 +659,14 @@ class AutoWatermarkWindow(_DndBase):
             self._logo_portrait_scales.append(18)
             self._logo_positions.append(POSITION_THAI["top-right"])
             self._logo_opacities.append(1.0)
+            self._logo_offset_x.append(0)
             self._add_logo_row(idx)
 
         if self._logo_paths:
             self._logo_empty_label.grid_remove()
             self._select_logo(len(self._logo_paths) - 1)
 
+        self._apply_auto_arrange()
         self._update_start_button()
         self._schedule_preview()
 
@@ -716,6 +722,32 @@ class AutoWatermarkWindow(_DndBase):
 
         self._logo_list_rows.append(row)
 
+    def _apply_auto_arrange(self) -> None:
+        """Queue logos side-by-side in a horizontal row anchored at top-right.
+        Logo 0 is rightmost; each subsequent logo extends the queue to the left.
+        Acts as a default starting point — user can still drag/change position."""
+        n = len(self._logo_paths)
+        # Single logo: keep top-right with no offset
+        if n == 1:
+            self._logo_positions[0] = POSITION_THAI["top-right"]
+            self._logo_offset_x[0] = 0
+            if self._selected_logo_idx == 0:
+                self.position_thai_var.set(self._logo_positions[0])
+            return
+        if n < 2:
+            return
+        # Multiple logos: all top-right, offset_x spreads them left from the right edge
+        cumulative = 0
+        for i in range(n):
+            self._logo_positions[i] = POSITION_THAI["top-right"]
+            self._logo_offset_x[i] = -cumulative
+            est_w = max(1, round(1280 * self._logo_landscape_scales[i] / 100))
+            cumulative += est_w + _QUEUE_GAP
+        # Sync dropdown UI for the currently selected logo
+        sel = self._selected_logo_idx
+        if 0 <= sel < n:
+            self.position_thai_var.set(self._logo_positions[sel])
+
     def _remove_logo(self, idx: int) -> None:
         if idx >= len(self._logo_paths):
             return
@@ -733,6 +765,7 @@ class AutoWatermarkWindow(_DndBase):
         self._logo_portrait_scales.pop(idx)
         self._logo_positions.pop(idx)
         self._logo_opacities.pop(idx)
+        self._logo_offset_x.pop(idx)
 
         # Re-grid remaining rows (their index shifted)
         for i, row in enumerate(self._logo_list_rows):
@@ -754,6 +787,7 @@ class AutoWatermarkWindow(_DndBase):
             self._load_logo_settings_into_ui(new_idx)
 
         self._update_start_button()
+        self._apply_auto_arrange()
         self._schedule_preview()
 
     def _select_logo(self, idx: int) -> None:
@@ -1107,8 +1141,12 @@ class AutoWatermarkWindow(_DndBase):
                     lx = max(0, min(round(drag_ratio[0] * base_w), base_w - logo_w))
                     ly = max(0, min(round(drag_ratio[1] * base_h), base_h - logo_h))
                 else:
+                    auto_ox = (
+                        self._logo_offset_x[idx]
+                        if idx < len(self._logo_offset_x) else 0
+                    )
                     lx, ly = calculate_position(
-                        base.size, (logo_w, logo_h), pos_key, 0, 0, 0)
+                        base.size, (logo_w, logo_h), pos_key, auto_ox, 0, 0)
 
                 clw = max(1, round(logo_w * scale))
                 clh = max(1, round(logo_h * scale))
@@ -1681,6 +1719,7 @@ class AutoWatermarkWindow(_DndBase):
                 portrait_logo_scale_percent=p_scale,
                 margin=0,
                 opacity=opacity,
+                offset_x=self._logo_offset_x[logo_idx],
             )
             logo_configs.append(LogoConfig(logo_path=logo_path, settings=logo_settings))
 
