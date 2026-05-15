@@ -9,6 +9,11 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk  # type: ignore[import-untyped]
 from PIL import Image, ImageOps, ImageTk  # type: ignore[import-untyped]
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES  # type: ignore[import-untyped]
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
 
 from core.image_ops import calculate_position
 from core.models import (
@@ -43,7 +48,17 @@ POSITION_THAI: dict[str, str] = {
 THAI_TO_POSITION: dict[str, str] = {v: k for k, v in POSITION_THAI.items()}
 
 
-class AutoWatermarkWindow(ctk.CTk):
+if _DND_AVAILABLE:
+    class _DndBase(ctk.CTk, TkinterDnD.DnDWrapper):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.TkdndVersion = TkinterDnD._require(self)
+else:
+    class _DndBase(ctk.CTk):  # type: ignore[misc]
+        pass
+
+
+class AutoWatermarkWindow(_DndBase):
     """Main window — left controls, right canvas preview + filmstrip."""
 
     def __init__(self) -> None:
@@ -122,34 +137,41 @@ class AutoWatermarkWindow(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self._build_left_panel()
         self._build_right_panel()
+        self._update_step_indicators()
 
     # ── Left panel ─────────────────────────────────────────────────────
 
     def _build_left_panel(self) -> None:
-        panel = ctk.CTkFrame(self, width=264, corner_radius=0)
+        outer = ctk.CTkFrame(self, width=280, corner_radius=0)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.grid_propagate(False)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+
+        panel = ctk.CTkScrollableFrame(outer, corner_radius=0, fg_color="transparent")
         panel.grid(row=0, column=0, sticky="nsew")
-        panel.grid_propagate(False)
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(4, weight=1)
 
         brand = ctk.CTkFrame(panel, fg_color="transparent")
         brand.grid(row=0, column=0, padx=16, pady=(20, 14), sticky="ew")
         ctk.CTkLabel(
             brand, text="Auto Watermark",
-            font=ctk.CTkFont(size=17, weight="bold"),
+            font=ctk.CTkFont(size=18, weight="bold"),
         ).pack(anchor="w")
         ctk.CTkLabel(
             brand, text="Resize · Watermark · Export",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray55"),
         ).pack(anchor="w")
 
         self._build_logo_zone(panel, row=1)
         self._build_input_zone(panel, row=2)
-        self._build_settings(panel, row=3)
-        ctk.CTkFrame(panel, fg_color="transparent").grid(row=4, column=0, sticky="nsew")
-        self._build_progress_section(panel, row=5)
-        self._build_footer(panel, row=6)
+        ctk.CTkFrame(panel, height=1, fg_color=("gray70", "gray35")).grid(
+            row=3, column=0, padx=16, pady=(0, 4), sticky="ew")
+        self._build_settings(panel, row=4)
+        self._build_per_image_actions(panel, row=5)
+        self._build_progress_section(panel, row=6)
+        self._build_footer(panel, row=7)
 
     def _build_logo_zone(self, parent: ctk.CTkFrame, row: int) -> None:
         self.logo_card = ctk.CTkFrame(parent, corner_radius=12)
@@ -166,13 +188,20 @@ class AutoWatermarkWindow(ctk.CTk):
 
         txt = ctk.CTkFrame(self.logo_card, fg_color="transparent")
         txt.grid(row=0, column=1, pady=12, sticky="ew")
+        self.step1_badge = ctk.CTkLabel(
+            txt, text="STEP 1",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"),
+            corner_radius=4,
+        )
+        self.step1_badge.pack(anchor="w", pady=(0, 2))
         ctk.CTkLabel(
             txt, text="โลโก้ (.png)",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(anchor="w")
         self.logo_name_label = ctk.CTkLabel(
             txt, text="ยังไม่ได้เลือก",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray55"),
             wraplength=130, justify="left",
         )
@@ -180,7 +209,7 @@ class AutoWatermarkWindow(ctk.CTk):
 
         ctk.CTkButton(
             self.logo_card, text="เลือก",
-            width=58, height=30, font=ctk.CTkFont(size=12),
+            width=62, height=32, font=ctk.CTkFont(size=13),
             fg_color=("gray78", "gray32"),
             text_color=("gray10", "gray90"),
             hover_color=("gray68", "gray42"),
@@ -197,31 +226,70 @@ class AutoWatermarkWindow(ctk.CTk):
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header, text="📁  รูปภาพต้นฉบับ",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=14, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
         self.image_count_badge = ctk.CTkLabel(
             header, text="",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             fg_color=TEAL, text_color="white", corner_radius=8,
         )
+        self.step2_badge = ctk.CTkLabel(
+            header, text="STEP 2",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"),
+            corner_radius=4,
+        )
+        self.step2_badge.grid(row=0, column=2, padx=(4, 0))
 
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
         btn_row.grid(row=1, column=0, padx=14, pady=(0, 6), sticky="ew")
         btn_row.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(
             btn_row, text="เลือกหลายไฟล์",
-            height=34, font=ctk.CTkFont(size=12),
+            height=36, font=ctk.CTkFont(size=13),
             command=self._choose_files,
         ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
         ctk.CTkButton(
             btn_row, text="เลือกโฟลเดอร์",
-            height=34, font=ctk.CTkFont(size=12),
+            height=36, font=ctk.CTkFont(size=13),
             command=self._choose_folder,
         ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
+        # ── Drop zone ──────────────────────────────────────────────────
+        self._drop_zone = tk.Frame(
+            card,
+            height=52,
+            relief="flat",
+            highlightthickness=2,
+            highlightbackground="#4a4a6a",
+            bg="#1e1e2e",
+            cursor="hand2",
+        )
+        self._drop_zone.grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self._drop_zone.grid_propagate(False)
+        self._drop_zone_label = tk.Label(
+            self._drop_zone,
+            text="⬇  ลากไฟล์หรือโฟลเดอร์มาวางที่นี่",
+            bg="#1e1e2e",
+            fg="#8888bb",
+            font=("Segoe UI", 11),
+        )
+        self._drop_zone_label.place(relx=0.5, rely=0.5, anchor="center")
+        if _DND_AVAILABLE:
+            for w in (self._drop_zone, self._drop_zone_label):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", self._on_dnd_drop)
+                w.dnd_bind("<<DragEnter>>", self._on_dnd_enter)
+                w.dnd_bind("<<DragLeave>>", self._on_dnd_leave)
+        else:
+            self._drop_zone_label.configure(
+                text="⬇  ลากไฟล์ (ต้องการ tkinterdnd2)",
+                fg="#666688",
+            )
+
         self.clear_button = ctk.CTkButton(
             card, text="🗑  ล้างรายการทั้งหมด",
-            height=28, font=ctk.CTkFont(size=11),
+            height=30, font=ctk.CTkFont(size=12),
             fg_color="transparent",
             text_color=("gray40", "gray60"),
             hover_color=("gray80", "gray28"),
@@ -229,48 +297,59 @@ class AutoWatermarkWindow(ctk.CTk):
             border_color=("gray70", "gray40"),
             command=self._clear_images,
         )
-        self.clear_button.grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self.clear_button.grid(row=3, column=0, padx=14, pady=(0, 6), sticky="ew")
         self.clear_button.grid_remove()
 
         self.input_status_label = ctk.CTkLabel(
             card, text="ยังไม่ได้เลือกรูปภาพ",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray55"),
         )
-        self.input_status_label.grid(row=3, column=0, padx=14, pady=(0, 10), sticky="w")
+        self.input_status_label.grid(row=4, column=0, padx=14, pady=(0, 10), sticky="w")
 
     def _build_settings(self, parent: ctk.CTkFrame, row: int) -> None:
         self.settings_card = ctk.CTkFrame(parent, corner_radius=12)
         self.settings_card.grid(row=row, column=0, padx=12, pady=(0, 8), sticky="ew")
         self.settings_card.grid_columnconfigure(0, weight=1)
 
+        settings_hdr = ctk.CTkFrame(self.settings_card, fg_color="transparent")
+        settings_hdr.grid(row=0, column=0, padx=14, pady=(12, 8), sticky="ew")
+        settings_hdr.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            self.settings_card, text="⚙  ตั้งค่าโลโก้",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, padx=14, pady=(12, 8), sticky="w")
+            settings_hdr, text="⚙  ตั้งค่าโลโก้",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.step3_badge = ctk.CTkLabel(
+            settings_hdr, text="STEP 3",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"),
+            corner_radius=4,
+        )
+        self.step3_badge.grid(row=0, column=1)
 
         ctk.CTkLabel(
-            self.settings_card, text="ตำแหน่ง", font=ctk.CTkFont(size=12),
+            self.settings_card, text="ตำแหน่ง", font=ctk.CTkFont(size=13),
         ).grid(row=1, column=0, padx=14, pady=(0, 4), sticky="w")
 
-        ctk.CTkOptionMenu(
+        self._position_option = ctk.CTkOptionMenu(
             self.settings_card,
             values=list(POSITION_THAI.values()),
             variable=self.position_thai_var,
             command=self._on_position_changed,
-        ).grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
+        )
+        self._position_option.grid(row=2, column=0, padx=14, pady=(0, 6), sticky="ew")
 
         self.custom_pos_label = ctk.CTkLabel(
             self.settings_card,
             text="📍 กำหนดเอง  (ลากโลโก้บน preview)",
-            font=ctk.CTkFont(size=11), text_color=TEAL,
+            font=ctk.CTkFont(size=12), text_color=TEAL,
         )
         self.custom_pos_label.grid(row=3, column=0, padx=14, pady=(0, 2), sticky="w")
         self.custom_pos_label.grid_remove()
 
         self.reset_pos_button = ctk.CTkButton(
             self.settings_card, text="รีเซ็ตตำแหน่ง",
-            height=26, font=ctk.CTkFont(size=11),
+            height=28, font=ctk.CTkFont(size=12),
             fg_color=("gray78", "gray32"),
             text_color=("gray10", "gray90"),
             hover_color=("gray68", "gray42"),
@@ -284,46 +363,48 @@ class AutoWatermarkWindow(ctk.CTk):
         scale_h_l.grid(row=5, column=0, padx=14, pady=(4, 2), sticky="ew")
         scale_h_l.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            scale_h_l, text="ขนาดโลโก้  🖼 แนวนอน", font=ctk.CTkFont(size=12),
+            scale_h_l, text="ขนาดโลโก้  🖼 แนวนอน", font=ctk.CTkFont(size=13),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             scale_h_l, textvariable=self.scale_display_var,
-            font=ctk.CTkFont(size=12), text_color=TEAL,
+            font=ctk.CTkFont(size=13), text_color=TEAL,
         ).grid(row=0, column=1, sticky="e")
 
-        ctk.CTkSlider(
+        self._scale_landscape_slider = ctk.CTkSlider(
             self.settings_card,
             from_=5, to=60,
             variable=self.logo_scale_var,
             button_color=TEAL, button_hover_color=TEAL_DARK, progress_color=TEAL,
             command=self._on_scale_changed,
-        ).grid(row=6, column=0, padx=14, pady=(0, 6), sticky="ew")
+        )
+        self._scale_landscape_slider.grid(row=6, column=0, padx=14, pady=(0, 6), sticky="ew")
 
         # ── Scale: Portrait ────────────────────────────────────────────
         scale_h_p = ctk.CTkFrame(self.settings_card, fg_color="transparent")
         scale_h_p.grid(row=7, column=0, padx=14, pady=(2, 2), sticky="ew")
         scale_h_p.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            scale_h_p, text="ขนาดโลโก้  📱 แนวตั้ง", font=ctk.CTkFont(size=12),
+            scale_h_p, text="ขนาดโลโก้  📱 แนวตั้ง", font=ctk.CTkFont(size=13),
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             scale_h_p, textvariable=self.scale_portrait_display_var,
-            font=ctk.CTkFont(size=12), text_color=TEAL,
+            font=ctk.CTkFont(size=13), text_color=TEAL,
         ).grid(row=0, column=1, sticky="e")
 
-        ctk.CTkSlider(
+        self._scale_portrait_slider = ctk.CTkSlider(
             self.settings_card,
             from_=5, to=60,
             variable=self.logo_scale_portrait_var,
             button_color=TEAL, button_hover_color=TEAL_DARK, progress_color=TEAL,
             command=self._on_scale_portrait_changed,
-        ).grid(row=8, column=0, padx=14, pady=(0, 8), sticky="ew")
+        )
+        self._scale_portrait_slider.grid(row=8, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
-            self.settings_card, text="ขนาดเอาต์พุต", font=ctk.CTkFont(size=12),
+            self.settings_card, text="ขนาดเอาต์พุต", font=ctk.CTkFont(size=13),
         ).grid(row=9, column=0, padx=14, pady=(8, 4), sticky="w")
 
-        ctk.CTkSegmentedButton(
+        self._output_size_segmented = ctk.CTkSegmentedButton(
             self.settings_card,
             values=[OUTPUT_SIZE_RESIZE_1280, OUTPUT_SIZE_ORIGINAL],
             variable=self.output_size_var,
@@ -331,40 +412,57 @@ class AutoWatermarkWindow(ctk.CTk):
             selected_hover_color=TEAL_DARK,
             font=ctk.CTkFont(size=11),
             command=self._on_output_size_changed,
-        ).grid(row=10, column=0, padx=14, pady=(0, 8), sticky="ew")
+        )
+        self._output_size_segmented.grid(row=10, column=0, padx=14, pady=(0, 8), sticky="ew")
 
         ctk.CTkLabel(
             self.settings_card,
             text="💡 ลากโลโก้บน preview · Scroll ปรับขนาด",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray55"),
-        ).grid(row=11, column=0, padx=14, pady=(0, 8), sticky="w")
+        ).grid(row=11, column=0, padx=14, pady=(0, 12), sticky="w")
 
-        # ── Per-image action buttons ───────────────────────────────────
-        sep = ctk.CTkFrame(self.settings_card, height=1, fg_color=("gray70", "gray35"))
-        sep.grid(row=12, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self._settings_interactive_widgets = [
+            self._position_option,
+            self._scale_landscape_slider,
+            self._scale_portrait_slider,
+            self._output_size_segmented,
+        ]
+
+    def _build_per_image_actions(self, parent: ctk.CTkFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=12)
+        card.grid(row=row, column=0, padx=12, pady=(0, 8), sticky="ew")
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card,
+            text="⚠  การตั้งค่าข้างต้นใช้กับรูปนี้เท่านั้น",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray58"),
+            wraplength=220, justify="left",
+        ).grid(row=0, column=0, padx=14, pady=(10, 4), sticky="w")
 
         ctk.CTkButton(
-            self.settings_card,
-            text="📋  ใช้ค่านี้กับทุกรูป",
-            height=28, font=ctk.CTkFont(size=11),
+            card,
+            text="📋  คัดลอกค่านี้ → ทุกรูป",
+            height=32, font=ctk.CTkFont(size=12),
             fg_color=("gray78", "gray32"),
             text_color=("gray10", "gray90"),
             hover_color=("gray68", "gray42"),
             command=self._apply_to_all,
-        ).grid(row=13, column=0, padx=14, pady=(0, 4), sticky="ew")
+        ).grid(row=1, column=0, padx=14, pady=(0, 4), sticky="ew")
 
         ctk.CTkButton(
-            self.settings_card,
-            text="🔄  รีเซ็ตทุกรูป",
-            height=28, font=ctk.CTkFont(size=11),
+            card,
+            text="🔄  รีเซ็ตทุกรูปเป็นค่าเริ่มต้น",
+            height=32, font=ctk.CTkFont(size=12),
             fg_color="transparent",
             text_color=("gray40", "gray60"),
             hover_color=("gray80", "gray28"),
             border_width=1,
             border_color=("gray70", "gray40"),
             command=self._reset_all_overrides,
-        ).grid(row=14, column=0, padx=14, pady=(0, 12), sticky="ew")
+        ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="ew")
 
     def _build_progress_section(self, parent: ctk.CTkFrame, row: int) -> None:
         self.progress_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -374,7 +472,7 @@ class AutoWatermarkWindow(ctk.CTk):
 
         ctk.CTkLabel(
             self.progress_frame, textvariable=self.status_var,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray55"),
         ).grid(row=0, column=0, pady=(0, 4), sticky="w")
 
@@ -391,7 +489,7 @@ class AutoWatermarkWindow(ctk.CTk):
         self.start_button = ctk.CTkButton(
             footer,
             text="▶  START เริ่มประมวลผล",
-            height=52, font=ctk.CTkFont(size=15, weight="bold"),
+            height=54, font=ctk.CTkFont(size=16, weight="bold"),
             fg_color=TEAL, hover_color=TEAL_DARK,
             command=self._start_processing,
             state="disabled",
@@ -400,7 +498,7 @@ class AutoWatermarkWindow(ctk.CTk):
 
         self.open_folder_button = ctk.CTkButton(
             footer, text="📂  เปิดโฟลเดอร์ผลลัพธ์",
-            height=36, font=ctk.CTkFont(size=12),
+            height=38, font=ctk.CTkFont(size=13),
             command=self._open_output_folder,
         )
 
@@ -507,6 +605,57 @@ class AutoWatermarkWindow(ctk.CTk):
     # ═══════════════════════════════════════════════════════════════════
     # INPUT — FILES / FOLDER
     # ═══════════════════════════════════════════════════════════════════
+
+    # ── Drag-and-drop handlers ─────────────────────────────────────────
+    def _on_dnd_enter(self, event: object) -> None:
+        self._drop_zone.configure(highlightbackground=TEAL, bg="#1a2e2a")
+        self._drop_zone_label.configure(fg=TEAL, bg="#1a2e2a")
+
+    def _on_dnd_leave(self, event: object) -> None:
+        self._drop_zone.configure(highlightbackground="#4a4a6a", bg="#1e1e2e")
+        self._drop_zone_label.configure(fg="#8888bb", bg="#1e1e2e")
+
+    def _on_dnd_drop(self, event: object) -> None:
+        self._on_dnd_leave(event)
+        raw: str = event.data  # type: ignore[attr-defined]
+        paths = self._parse_dnd_data(raw)
+        merged: list[Path] = []
+        for p in paths:
+            if p.is_dir():
+                merged.extend(
+                    sorted(
+                        f for f in p.iterdir()
+                        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+                    )
+                )
+            elif p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                merged.append(p)
+        if merged:
+            self._merge_paths(merged)
+
+    @staticmethod
+    def _parse_dnd_data(raw: str) -> list[Path]:
+        """Parse tkinterdnd2 drop data — handles paths with spaces wrapped in {}."""
+        paths: list[Path] = []
+        raw = raw.strip()
+        i = 0
+        while i < len(raw):
+            if raw[i] == "{":
+                end = raw.find("}", i)
+                if end == -1:
+                    break
+                paths.append(Path(raw[i + 1:end]))
+                i = end + 2  # skip "} "
+            else:
+                # find next space that is not inside braces
+                j = i
+                while j < len(raw) and raw[j] != " ":
+                    j += 1
+                token = raw[i:j]
+                if token:
+                    paths.append(Path(token))
+                i = j + 1
+        return paths
 
     def _choose_files(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -1178,6 +1327,33 @@ class AutoWatermarkWindow(ctk.CTk):
             self.start_button.configure(state="normal")
         else:
             self.start_button.configure(state="disabled")
+        self._update_step_indicators()
+
+    def _update_step_indicators(self) -> None:
+        step1_done = self.logo_path is not None
+        step2_done = bool(self.image_paths)
+
+        if step1_done:
+            self.step1_badge.configure(fg_color=TEAL, text_color="white", text="✓ STEP 1")
+        else:
+            self.step1_badge.configure(
+                fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"), text="STEP 1")
+
+        if step2_done:
+            self.step2_badge.configure(fg_color=TEAL, text_color="white", text="✓ STEP 2")
+        else:
+            self.step2_badge.configure(
+                fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"), text="STEP 2")
+
+        if step1_done:
+            self.step3_badge.configure(fg_color=TEAL, text_color="white", text="✓ STEP 3")
+        else:
+            self.step3_badge.configure(
+                fg_color=("gray75", "gray30"), text_color=("gray50", "gray55"), text="STEP 3")
+
+        new_state = "normal" if step1_done else "disabled"
+        for w in self._settings_interactive_widgets:
+            w.configure(state=new_state)
 
     # ═══════════════════════════════════════════════════════════════════
     # PROCESSING
