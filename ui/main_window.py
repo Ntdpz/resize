@@ -444,13 +444,23 @@ class AutoWatermarkWindow(_DndBase):
 
         ctk.CTkButton(
             card,
-            text="📋  คัดลอกค่านี้ → ทุกรูป",
+            text="�  นำค่านี้ → รูปแนวนอนทั้งหมด",
             height=32, font=ctk.CTkFont(size=12),
             fg_color=("gray78", "gray32"),
             text_color=("gray10", "gray90"),
             hover_color=("gray68", "gray42"),
-            command=self._apply_to_all,
+            command=self._apply_to_landscape,
         ).grid(row=1, column=0, padx=14, pady=(0, 4), sticky="ew")
+
+        ctk.CTkButton(
+            card,
+            text="📱  นำค่านี้ → รูปแนวตั้งทั้งหมด",
+            height=32, font=ctk.CTkFont(size=12),
+            fg_color=("gray78", "gray32"),
+            text_color=("gray10", "gray90"),
+            hover_color=("gray68", "gray42"),
+            command=self._apply_to_portrait,
+        ).grid(row=2, column=0, padx=14, pady=(0, 4), sticky="ew")
 
         ctk.CTkButton(
             card,
@@ -462,7 +472,7 @@ class AutoWatermarkWindow(_DndBase):
             border_width=1,
             border_color=("gray70", "gray40"),
             command=self._reset_all_overrides,
-        ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="ew")
+        ).grid(row=3, column=0, padx=14, pady=(0, 10), sticky="ew")
 
     def _build_progress_section(self, parent: ctk.CTkFrame, row: int) -> None:
         self.progress_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1207,6 +1217,42 @@ class AutoWatermarkWindow(_DndBase):
             margin=0,
         )
         self._update_filmstrip_badges()
+
+    def _get_image_orientation(self, path: Path) -> str:
+        """Return 'landscape' or 'portrait' based on the image's actual dimensions."""
+        try:
+            with Image.open(path) as img:
+                w, h = img.size
+            return "landscape" if w > h else "portrait"
+        except Exception:
+            return "landscape"
+
+    def _apply_to_orientation(self, orientation: str) -> None:
+        """Copy the current image's settings only to images of the given orientation."""
+        if self.selected_preview_path is None:
+            return
+        self._save_current_image_settings()
+        src = self._per_image_overrides.get(self.selected_preview_path)
+        if src is None:
+            return
+        ratio = self._per_image_pos_ratios.get(self.selected_preview_path)
+        for path in self.image_paths:
+            if self._get_image_orientation(path) != orientation:
+                continue
+            self._per_image_overrides[path] = src
+            if ratio is not None:
+                self._per_image_pos_ratios[path] = ratio
+            else:
+                self._per_image_pos_ratios.pop(path, None)
+        self._update_filmstrip_badges()
+
+    def _apply_to_landscape(self) -> None:
+        """Copy current settings to all landscape images."""
+        self._apply_to_orientation("landscape")
+
+    def _apply_to_portrait(self) -> None:
+        """Copy current settings to all portrait images."""
+        self._apply_to_orientation("portrait")
 
     def _apply_to_all(self) -> None:
         """Copy the current image's settings to every loaded image."""
