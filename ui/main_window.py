@@ -144,8 +144,21 @@ class AutoWatermarkWindow(_DndBase):
     # ═══════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
+
+        is_dark = ctk.get_appearance_mode().lower() == "dark"
+        sash_bg = "#1a1a2a" if is_dark else "#b0b0b0"
+        self._paned = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            sashwidth=6,
+            sashrelief="flat",
+            sashcursor="sb_h_double_arrow",
+            bg=sash_bg,
+        )
+        self._paned.grid(row=0, column=0, sticky="nsew")
+
         self._build_left_panel()
         self._build_right_panel()
         self._update_step_indicators()
@@ -153,11 +166,10 @@ class AutoWatermarkWindow(_DndBase):
     # ── Left panel ─────────────────────────────────────────────────────
 
     def _build_left_panel(self) -> None:
-        outer = ctk.CTkFrame(self, width=280, corner_radius=0)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.grid_propagate(False)
+        outer = ctk.CTkFrame(self._paned, width=280, corner_radius=0)
         outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(0, weight=1)
+        self._paned.add(outer, minsize=180, width=280)
 
         panel = ctk.CTkScrollableFrame(outer, corner_radius=0, fg_color="transparent")
         panel.grid(row=0, column=0, sticky="nsew")
@@ -548,9 +560,9 @@ class AutoWatermarkWindow(_DndBase):
     # ── Right panel ────────────────────────────────────────────────────
 
     def _build_right_panel(self) -> None:
-        right = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray90", "gray13"))
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ctk.CTkFrame(self._paned, corner_radius=0, fg_color=("gray90", "gray13"))
         right.grid_columnconfigure(0, weight=1)
+        self._paned.add(right, minsize=400)
         right.grid_rowconfigure(0, weight=1)
         right.grid_rowconfigure(1, minsize=118)
 
