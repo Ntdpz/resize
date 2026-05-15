@@ -34,6 +34,7 @@ class PlacementSettings:
     landscape_logo_scale_percent: int = 0  # 0 = use logo_scale_percent
     portrait_logo_scale_percent: int = 0   # 0 = use logo_scale_percent
     quality: int = 95
+    opacity: float = 1.0                   # 0.0 (transparent) – 1.0 (opaque)
 
     def effective_landscape_scale(self) -> int:
         return self.landscape_logo_scale_percent or self.logo_scale_percent
@@ -43,13 +44,21 @@ class PlacementSettings:
 
 
 @dataclass(frozen=True)
-class BatchRequest:
+class LogoConfig:
+    """One logo entry: its source file plus placement/style settings."""
     logo_path: Path
     settings: PlacementSettings
+
+
+@dataclass(frozen=True)
+class BatchRequest:
+    logos: tuple[LogoConfig, ...]          # one or more logos (replaces logo_path)
+    settings: PlacementSettings            # image-level defaults (output_size, quality)
     source_folder: Path | None = None
     source_paths: tuple[Path, ...] = ()
     output_folder: Path | None = None
-    settings_by_path: dict[Path, PlacementSettings] = field(
+    # [image_path][logo_idx] = per-image per-logo override (position/scale/opacity)
+    logo_settings_by_path: dict[Path, dict[int, PlacementSettings]] = field(
         default_factory=dict
     )
 

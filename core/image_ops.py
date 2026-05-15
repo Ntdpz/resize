@@ -11,6 +11,8 @@ from core.models import (
     PlacementSettings,
 )
 
+from PIL import ImageEnhance  # type: ignore[import-untyped]
+
 
 TARGET_WIDTH = 1280
 PREVIEW_MAX_DIMENSION = 520
@@ -106,6 +108,17 @@ def apply_watermark(
     return composite
 
 
+def apply_all_watermarks(
+    image: Image.Image,
+    logo_settings: list[tuple[Image.Image, PlacementSettings]],
+) -> Image.Image:
+    """Apply multiple watermarks sequentially onto the image."""
+    result = image
+    for logo_img, settings in logo_settings:
+        result = apply_watermark(result, logo_img, settings)
+    return result
+
+
 def build_watermark_scene(
     image: Image.Image,
     logo: Image.Image,
@@ -141,6 +154,12 @@ def build_watermark_scene(
         effective_scale,
     )
     resized_logo = logo_rgba.resize(logo_size, Image.Resampling.LANCZOS)
+    # Apply opacity by scaling the alpha channel
+    if settings.opacity < 1.0:
+        opacity_val = max(0.0, min(1.0, settings.opacity))
+        r, g, b, a = resized_logo.split()
+        a = a.point(lambda x: int(x * opacity_val))
+        resized_logo = Image.merge("RGBA", (r, g, b, a))
     position = calculate_position(
         base_image.size,
         resized_logo.size,

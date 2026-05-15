@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 from pathlib import Path
 from typing import Callable, Iterable
 
 from PIL import Image  # type: ignore[import-untyped]
 
-from core.image_ops import apply_watermark, save_processed_image
-from core.models import BatchRequest, ProcessedFile, SUPPORTED_EXTENSIONS
+from core.image_ops import apply_all_watermarks, save_processed_image
+from core.models import BatchRequest, PlacementSettings, ProcessedFile, SUPPORTED_EXTENSIONS
 
 
 ProgressCallback = Callable[[int, int, Path], None]
@@ -61,28 +63,43 @@ def process_batch(
         raise ValueError(
             "No supported image files were found in the selected folder."
         )
+    if not request.logos:
+        raise ValueError("No logos provided in the batch request.")
 
     output_folder = request.output_folder or get_output_folder(image_paths[0])
     processed_files: list[ProcessedFile] = []
 
-    with Image.open(request.logo_path) as logo_image:
-        for index, image_path in enumerate(image_paths, start=1):
-            image_settings = request.settings_by_path.get(
-                image_path,
-                request.settings,
-            )
-            with Image.open(image_path) as source_image:
-                result_image = apply_watermark(
-                    source_image,
-                    logo_image,
-                    image_settings,
-                )
+    with contextlib.ExitStack() as stack:
+        logo_images = [
+            stack.enter_context(Image.open(lc.logo_path))
+            for lc in request.logos
+        ]
 
+        for index, image_path in enumerate(image_paths, start=1):
+            per_logo_overrides = request.logo_settings_by_path.get(image_path, {})
+
+            logo_settings_list: list[tuple[Image.Image, PlacementSettings]] = []
+            for logo_idx, (logo_cfg, logo_img) in enumerate(
+                zip(request.logos, logo_images)
+            ):
+                logo_settings = per_logo_overrides.get(logo_idx, logo_cfg.settings)
+                # Always apply image-level output_size and quality from global settings
+                effective = dataclasses.replace(
+                    logo_settings,
+                    output_size_mode=request.settings.output_size_mode,
+                    quality=request.settings.quality,
+                )
+                logo_settings_list.append((logo_img, effective))
+
+            with Image.open(image_path) as source_image:
+                result_image = apply_all_watermarks(source_image, logo_settings_list)
+
+            # Quality comes from global settings
             output_path = output_folder / image_path.name
             save_processed_image(
                 result_image,
                 output_path,
-                image_settings.quality,
+                request.settings.quality,
             )
             processed_files.append(
                 ProcessedFile(
