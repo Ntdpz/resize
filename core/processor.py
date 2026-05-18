@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import contextlib
 import dataclasses
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Iterable
 
 from PIL import Image  # type: ignore[import-untyped]
 
-from core.image_ops import apply_all_watermarks, save_processed_image
+from core.image_ops import (
+    apply_all_watermarks,
+    prepare_logo_rgba,
+    save_processed_image,
+)
 from core.models import BatchRequest, PlacementSettings, ProcessedFile, SUPPORTED_EXTENSIONS
 
 
@@ -67,53 +73,74 @@ def process_batch(
         raise ValueError("No logos provided in the batch request.")
 
     output_folder = request.output_folder or get_output_folder(image_paths[0])
-    processed_files: list[ProcessedFile] = []
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    with contextlib.ExitStack() as stack:
-        logo_images = [
-            stack.enter_context(Image.open(lc.logo_path))
-            for lc in request.logos
-        ]
+    # Pre-process logos to RGBA once — avoids redundant work per image
+    prepared_logos: list[Image.Image] = []
+    raw_logos: list = []
+    try:
+        for lc in request.logos:
+            raw = Image.open(lc.logo_path)  # type: ignore[assignment]
+            raw_logos.append(raw)
+            prepared_logos.append(prepare_logo_rgba(raw))
+    finally:
+        for raw in raw_logos:
+            raw.close()
 
-        for index, image_path in enumerate(image_paths, start=1):
-            per_logo_overrides = request.logo_settings_by_path.get(image_path, {})
+    total = len(image_paths)
+    counter_lock = threading.Lock()
+    counter = [0]
 
-            logo_settings_list: list[tuple[Image.Image, PlacementSettings]] = []
-            for logo_idx, (logo_cfg, logo_img) in enumerate(
-                zip(request.logos, logo_images)
-            ):
-                logo_settings = per_logo_overrides.get(logo_idx, logo_cfg.settings)
-                # Always apply image-level output_size and quality from global settings
-                effective = dataclasses.replace(
-                    logo_settings,
-                    output_size_mode=request.settings.output_size_mode,
-                    quality=request.settings.quality,
-                )
-                logo_settings_list.append((logo_img, effective))
-
-            with Image.open(image_path) as source_image:
-                result_image = apply_all_watermarks(source_image, logo_settings_list)
-
-            # Quality comes from global settings
-            output_path = output_folder / image_path.name
-            save_processed_image(
-                result_image,
-                output_path,
-                request.settings.quality,
+    def process_one(image_path: Path) -> ProcessedFile:
+        per_logo_overrides = request.logo_settings_by_path.get(image_path, {})
+        logo_settings_list: list[tuple[Image.Image, PlacementSettings]] = []
+        for logo_idx, (logo_cfg, logo_img) in enumerate(
+            zip(request.logos, prepared_logos)
+        ):
+            logo_settings = per_logo_overrides.get(logo_idx, logo_cfg.settings)
+            effective = dataclasses.replace(
+                logo_settings,
+                output_size_mode=request.settings.output_size_mode,
+                quality=request.settings.quality,
             )
-            processed_files.append(
-                ProcessedFile(
-                    source_path=image_path,
-                    output_path=output_path,
-                    width=result_image.width,
-                    height=result_image.height,
-                )
+            logo_settings_list.append((logo_img, effective))
+
+        with Image.open(image_path) as source_image:
+            result_image = apply_all_watermarks(
+                source_image, logo_settings_list
             )
 
-            if progress_callback is not None:
-                progress_callback(index, len(image_paths), image_path)
+        output_path = output_folder / image_path.name
+        save_processed_image(
+            result_image, output_path, request.settings.quality
+        )
 
-    return processed_files
+        if progress_callback is not None:
+            with counter_lock:
+                counter[0] += 1
+                current = counter[0]
+            progress_callback(current, total, image_path)
+
+        return ProcessedFile(
+            source_path=image_path,
+            output_path=output_path,
+            width=result_image.width,
+            height=result_image.height,
+        )
+
+    # Cap at 4 workers to avoid RAM exhaustion on low-spec machines
+    max_workers = min(4, max(1, os.cpu_count() or 1))
+    results_map: dict[int, ProcessedFile] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_one, path): i
+            for i, path in enumerate(image_paths)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            results_map[idx] = future.result()  # re-raises on worker error
+
+    return [results_map[i] for i in range(total)]
 
 
 def iter_processed_files(

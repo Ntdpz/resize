@@ -47,6 +47,12 @@ def get_orientation(image: Image.Image) -> str:
     return "landscape" if image.width > image.height else "portrait"
 
 
+def prepare_logo_rgba(logo: Image.Image) -> Image.Image:
+    """Pre-process logo to RGBA once before batch processing."""
+    transposed = ImageOps.exif_transpose(logo) or logo
+    return transposed.convert("RGBA")
+
+
 def calculate_logo_size(
     base_width: int,
     logo: Image.Image,
@@ -112,11 +118,54 @@ def apply_all_watermarks(
     image: Image.Image,
     logo_settings: list[tuple[Image.Image, PlacementSettings]],
 ) -> Image.Image:
-    """Apply multiple watermarks sequentially onto the image."""
-    result = image
+    """Apply all watermarks in a single composite pass."""
+    if not logo_settings:
+        return image
+
+    # Build base image once — output_size_mode is shared across logo entries
+    first_settings = logo_settings[0][1]
+    transposed_image = ImageOps.exif_transpose(image) or image
+    base_image = resize_image(
+        transposed_image.convert("RGBA"),
+        should_resize=first_settings.output_size_mode != OUTPUT_SIZE_ORIGINAL,
+    )
+    orientation = get_orientation(base_image)
+
+    # Composite all logos onto one overlay layer, then apply to base once
+    overlay = Image.new("RGBA", base_image.size, (0, 0, 0, 0))
     for logo_img, settings in logo_settings:
-        result = apply_watermark(result, logo_img, settings)
-    return result
+        preset = (
+            settings.landscape_position if orientation == "landscape"
+            else settings.portrait_position
+        )
+        # Skip exif_transpose + convert if logo is already prepared as RGBA
+        logo_rgba = (
+            logo_img if logo_img.mode == "RGBA"
+            else (
+                ImageOps.exif_transpose(logo_img) or logo_img
+            ).convert("RGBA")
+        )
+        effective_scale = (
+            settings.effective_landscape_scale() if orientation == "landscape"
+            else settings.effective_portrait_scale()
+        )
+        logo_size = calculate_logo_size(
+            base_image.width, logo_rgba, effective_scale
+        )
+        resized_logo = logo_rgba.resize(logo_size, Image.Resampling.BILINEAR)
+        if settings.opacity < 1.0:
+            opacity_val = max(0.0, min(1.0, settings.opacity))
+            r, g, b, a = resized_logo.split()
+            a = a.point(lambda x: int(x * opacity_val))
+            resized_logo = Image.merge("RGBA", (r, g, b, a))
+        position = calculate_position(
+            base_image.size, resized_logo.size, preset,
+            settings.offset_x, settings.offset_y, settings.margin,
+        )
+        overlay.alpha_composite(resized_logo, dest=position)
+
+    base_image.alpha_composite(overlay)
+    return base_image
 
 
 def build_watermark_scene(
@@ -153,7 +202,7 @@ def build_watermark_scene(
         logo_rgba,
         effective_scale,
     )
-    resized_logo = logo_rgba.resize(logo_size, Image.Resampling.LANCZOS)
+    resized_logo = logo_rgba.resize(logo_size, Image.Resampling.BILINEAR)
     # Apply opacity by scaling the alpha channel
     if settings.opacity < 1.0:
         opacity_val = max(0.0, min(1.0, settings.opacity))
