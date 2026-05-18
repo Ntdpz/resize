@@ -137,6 +137,8 @@ class AutoWatermarkWindow(
         self._global_portrait_scale: int = 18
         # Monotonic counter — incremented on each render request to cancel stale ones
         self._preview_token: int = 0
+        # Bounded cache: (path, cw, ch) → (pil, base_w, base_h)
+        self._preview_img_cache: dict = {}
 
         self._build_ui()
         self._refresh_template_buttons()

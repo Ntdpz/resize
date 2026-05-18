@@ -58,21 +58,37 @@ class CanvasMixin:
     ) -> None:
         """Heavy PIL work — runs on a background thread."""
         try:
-            with Image.open(path) as raw:
-                raw = (ImageOps.exif_transpose(raw) or raw).convert("RGBA")
-
-            if raw.width != TARGET_WIDTH:
-                new_h = round(TARGET_WIDTH / raw.width * raw.height)
-                base = raw.resize(
-                    (TARGET_WIDTH, new_h), Image.Resampling.LANCZOS
-                )
+            # Re-use cached base image when the same path+canvas size repeats
+            img_cache_key = (path, cw, ch)
+            _cached = self._preview_img_cache.get(img_cache_key)
+            if _cached is not None:
+                preview_base, base_w, base_h = _cached
             else:
-                base = raw.copy()
-            base_w, base_h = base.size
-            orientation = "landscape" if base_w > base_h else "portrait"
+                with Image.open(path) as raw:
+                    raw = ImageOps.exif_transpose(raw) or raw
+                # Logical coordinate space mirrors the batch output size
+                if raw.width != TARGET_WIDTH:
+                    base_w = TARGET_WIDTH
+                    base_h = round(
+                        TARGET_WIDTH / raw.width * raw.height
+                    )
+                else:
+                    base_w, base_h = raw.size
+                # Resize directly to canvas — skip the 1280px intermediate
+                preview_base = raw.convert("RGB")
+                preview_base.thumbnail(
+                    (cw, ch), Image.Resampling.LANCZOS
+                )
+                self._preview_img_cache[img_cache_key] = (
+                    preview_base, base_w, base_h
+                )
+                # Evict oldest when cache exceeds 50 entries
+                if len(self._preview_img_cache) > 50:
+                    self._preview_img_cache.pop(
+                        next(iter(self._preview_img_cache))
+                    )
 
-            preview_base = base.convert("RGB")
-            preview_base.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+            orientation = "landscape" if base_w > base_h else "portrait"
             pw, ph = preview_base.size
             scale = pw / base_w
             ox = (cw - pw) // 2
@@ -136,7 +152,7 @@ class CanvasMixin:
                         if idx < len(state["logo_offset_x"]) else 0
                     )
                     lx, ly = calculate_position(
-                        base.size, (logo_w, logo_h),
+                        (base_w, base_h), (logo_w, logo_h),
                         pos_key, auto_ox, 0, 0,
                     )
 

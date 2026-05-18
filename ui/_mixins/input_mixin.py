@@ -117,6 +117,7 @@ class InputMixin:
     def _clear_images(self) -> None:
         self.image_paths.clear()
         self._thumb_pil_cache.clear()
+        self._preview_img_cache.clear()
         self._per_image_overrides.clear()
         self._per_image_pos_ratios.clear()
         self.selected_preview_path = None
