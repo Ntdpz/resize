@@ -90,6 +90,7 @@ def process_batch(
     total = len(image_paths)
     counter_lock = threading.Lock()
     counter = [0]
+    logo_cache: dict = {}
 
     def process_one(image_path: Path) -> ProcessedFile:
         per_logo_overrides = request.logo_settings_by_path.get(image_path, {})
@@ -107,7 +108,7 @@ def process_batch(
 
         with Image.open(image_path) as source_image:
             result_image = apply_all_watermarks(
-                source_image, logo_settings_list
+                source_image, logo_settings_list, logo_cache
             )
 
         output_path = output_folder / image_path.name

@@ -135,6 +135,8 @@ class AutoWatermarkWindow(
         # True global scale / position defaults (used when no per-logo settings exist)
         self._global_landscape_scale: int = 18
         self._global_portrait_scale: int = 18
+        # Monotonic counter — incremented on each render request to cancel stale ones
+        self._preview_token: int = 0
 
         self._build_ui()
         self._refresh_template_buttons()

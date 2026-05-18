@@ -1,4 +1,5 @@
 from __future__ import annotations
+import threading
 import tkinter as tk
 from pathlib import Path
 from PIL import Image,ImageOps,ImageTk  # type: ignore[import-untyped]
@@ -10,6 +11,8 @@ from ui._mixins._constants import TEAL,TARGET_WIDTH,THAI_TO_POSITION,PREVIEW_DEB
 class CanvasMixin:
 
     def _render_preview(self, path: Path) -> None:
+        """Schedule a background render; returns immediately so UI
+        stays live."""
         if not self._logo_pils:
             return
         cw = self.preview_canvas.winfo_width()
@@ -18,13 +21,51 @@ class CanvasMixin:
             self.after(150, lambda: self._render_preview(path))
             return
 
+        # Increment token — any in-flight worker with a stale token
+        # will discard its result.
+        self._preview_token += 1
+        token = self._preview_token
+
+        # Snapshot all mutable UI state before handing off to the thread
+        state = {
+            "logo_pils": list(self._logo_pils),
+            "logo_landscape_scales": list(self._logo_landscape_scales),
+            "logo_portrait_scales": list(self._logo_portrait_scales),
+            "logo_positions": list(self._logo_positions),
+            "logo_opacities": list(self._logo_opacities),
+            "logo_offset_x": list(self._logo_offset_x),
+            "per_image_overrides": dict(
+                self._per_image_overrides.get(path, {})
+            ),
+            "per_image_pos_ratios": dict(
+                self._per_image_pos_ratios.get(path, {})
+            ),
+            "selected_logo_idx": self._selected_logo_idx,
+        }
+        threading.Thread(
+            target=self._render_preview_worker,
+            args=(path, token, cw, ch, state),
+            daemon=True,
+        ).start()
+
+    def _render_preview_worker(
+        self,
+        path: Path,
+        token: int,
+        cw: int,
+        ch: int,
+        state: dict,
+    ) -> None:
+        """Heavy PIL work — runs on a background thread."""
         try:
             with Image.open(path) as raw:
                 raw = (ImageOps.exif_transpose(raw) or raw).convert("RGBA")
 
             if raw.width != TARGET_WIDTH:
                 new_h = round(TARGET_WIDTH / raw.width * raw.height)
-                base = raw.resize((TARGET_WIDTH, new_h), Image.Resampling.LANCZOS)
+                base = raw.resize(
+                    (TARGET_WIDTH, new_h), Image.Resampling.LANCZOS
+                )
             else:
                 base = raw.copy()
             base_w, base_h = base.size
@@ -37,25 +78,12 @@ class CanvasMixin:
             ox = (cw - pw) // 2
             oy = (ch - ph) // 2
 
-            self._prev_scale = scale
-            self._prev_img_offset = (ox, oy)
-            self._prev_base_size = (base_w, base_h)
-
-            self._preview_base_photo = ImageTk.PhotoImage(preview_base)
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_image(
-                ox, oy, image=self._preview_base_photo, anchor="nw", tags="base")
-
-            self._canvas_logo_ids.clear()
-            self._preview_logo_photos = [None] * len(self._logo_pils)
-
-            for idx, logo_pil in enumerate(self._logo_pils):
+            logo_renders = []
+            for idx, logo_pil in enumerate(state["logo_pils"]):
                 if logo_pil is None:
                     continue
 
-                # Resolve settings: per-image per-logo override → logo global
-                img_overrides = self._per_image_overrides.get(path, {})
-                override = img_overrides.get(idx)
+                override = state["per_image_overrides"].get(idx)
                 if override is not None:
                     active_scale = (
                         override.effective_landscape_scale()
@@ -69,101 +97,173 @@ class CanvasMixin:
                     )
                 else:
                     active_scale = (
-                        self._logo_landscape_scales[idx]
+                        state["logo_landscape_scales"][idx]
                         if orientation == "landscape"
-                        else self._logo_portrait_scales[idx]
+                        else state["logo_portrait_scales"][idx]
                     )
                     pos_key = THAI_TO_POSITION.get(
-                        self._logo_positions[idx], "top-right")
+                        state["logo_positions"][idx], "top-right"
+                    )
 
-                logo_opacity = self._logo_opacities[idx]
-
+                logo_opacity = state["logo_opacities"][idx]
                 logo_w = max(1, round(base_w * active_scale / 100))
-                logo_h = max(1, round(logo_w * logo_pil.height / logo_pil.width))
+                logo_h = max(
+                    1, round(logo_w * logo_pil.height / logo_pil.width)
+                )
                 logo_resized = logo_pil.resize(
-                    (logo_w, logo_h), Image.Resampling.LANCZOS)
+                    (logo_w, logo_h), Image.Resampling.BILINEAR
+                )
 
-                # Apply opacity
                 if logo_opacity < 1.0:
+                    lut = [int(i * logo_opacity) for i in range(256)]
                     r, g, b, a = logo_resized.split()
-                    a = a.point(lambda x, op=logo_opacity: int(x * op))
+                    a = a.point(lut)
                     logo_resized = Image.merge("RGBA", (r, g, b, a))
 
-                # Resolve position: drag ratio → preset
-                drag_ratio = self._per_image_pos_ratios.get(path, {}).get(idx)
+                drag_ratio = state["per_image_pos_ratios"].get(idx)
                 if drag_ratio is not None:
-                    lx = max(0, min(round(drag_ratio[0] * base_w), base_w - logo_w))
-                    ly = max(0, min(round(drag_ratio[1] * base_h), base_h - logo_h))
+                    lx = max(
+                        0,
+                        min(round(drag_ratio[0] * base_w), base_w - logo_w),
+                    )
+                    ly = max(
+                        0,
+                        min(round(drag_ratio[1] * base_h), base_h - logo_h),
+                    )
                 else:
                     auto_ox = (
-                        self._logo_offset_x[idx]
-                        if idx < len(self._logo_offset_x) else 0
+                        state["logo_offset_x"][idx]
+                        if idx < len(state["logo_offset_x"]) else 0
                     )
                     lx, ly = calculate_position(
-                        base.size, (logo_w, logo_h), pos_key, auto_ox, 0, 0)
+                        base.size, (logo_w, logo_h),
+                        pos_key, auto_ox, 0, 0,
+                    )
 
                 clw = max(1, round(logo_w * scale))
                 clh = max(1, round(logo_h * scale))
                 canvas_logo = logo_resized.resize(
-                    (clw, clh), Image.Resampling.LANCZOS)
+                    (clw, clh), Image.Resampling.BILINEAR
+                )
                 clx = ox + round(lx * scale)
                 cly = oy + round(ly * scale)
+                logo_renders.append({
+                    "idx": idx,
+                    "canvas_pil": canvas_logo,
+                    "clx": clx,
+                    "cly": cly,
+                    "clw": clw,
+                    "clh": clh,
+                    "is_selected": idx == state["selected_logo_idx"],
+                })
 
-                tag = f"logo_{idx}"
-                photo = ImageTk.PhotoImage(canvas_logo)
-                self._preview_logo_photos[idx] = photo
-                canvas_id = self.preview_canvas.create_image(
-                    clx, cly, image=photo, anchor="nw", tags=("logo", tag))
-                self._canvas_logo_ids[idx] = canvas_id
+            # Discard if a newer render was already requested
+            if self._preview_token != token:
+                return
+            self._events.put(("preview_ready", {
+                "path": path,
+                "token": token,
+                "base_pil": preview_base,
+                "scale": scale,
+                "img_offset": (ox, oy),
+                "base_size": (base_w, base_h),
+                "logos": logo_renders,
+            }))
+        except Exception as exc:
+            if self._preview_token == token:
+                self._events.put(("preview_error", str(exc)))
 
-                # Selection decoration only for the selected logo
-                if idx == self._selected_logo_idx:
-                    self._prev_logo_size_canvas = (clw, clh)
-                    self._canvas_selection_id = self.preview_canvas.create_rectangle(
+    def _apply_preview_result(self, result: dict) -> None:
+        """Apply a completed preview render to the canvas
+        (main thread only)."""
+        if result["token"] != self._preview_token:
+            return
+        if result["path"] != self.selected_preview_path:
+            return
+
+        ox, oy = result["img_offset"]
+        scale = result["scale"]
+        base_w, base_h = result["base_size"]
+
+        self._prev_scale = scale
+        self._prev_img_offset = (ox, oy)
+        self._prev_base_size = (base_w, base_h)
+
+        # ImageTk.PhotoImage must be created on the main thread
+        self._preview_base_photo = ImageTk.PhotoImage(result["base_pil"])
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(
+            ox, oy, image=self._preview_base_photo, anchor="nw", tags="base"
+        )
+
+        self._canvas_logo_ids.clear()
+        self._preview_logo_photos = [None] * len(self._logo_pils)
+
+        for logo_data in result["logos"]:
+            idx = logo_data["idx"]
+            clx = logo_data["clx"]
+            cly = logo_data["cly"]
+            clw = logo_data["clw"]
+            clh = logo_data["clh"]
+            is_selected = logo_data["is_selected"]
+
+            photo = ImageTk.PhotoImage(logo_data["canvas_pil"])
+            self._preview_logo_photos[idx] = photo
+            tag = f"logo_{idx}"
+            canvas_id = self.preview_canvas.create_image(
+                clx, cly, image=photo, anchor="nw", tags=("logo", tag)
+            )
+            self._canvas_logo_ids[idx] = canvas_id
+
+            if is_selected:
+                self._prev_logo_size_canvas = (clw, clh)
+                self._canvas_selection_id = (
+                    self.preview_canvas.create_rectangle(
                         clx, cly, clx + clw, cly + clh,
                         outline=TEAL, width=2, dash=(6, 4), fill="",
-                        tags="selection")
-                    HR = 8
-                    self._canvas_handle_id = self.preview_canvas.create_oval(
-                        clx + clw - HR, cly + clh - HR,
-                        clx + clw + HR, cly + clh + HR,
-                        fill="white", outline=TEAL, width=2, tags="handle")
+                        tags="selection",
+                    )
+                )
+                HR = 8
+                self._canvas_handle_id = self.preview_canvas.create_oval(
+                    clx + clw - HR, cly + clh - HR,
+                    clx + clw + HR, cly + clh + HR,
+                    fill="white", outline=TEAL, width=2, tags="handle",
+                )
 
-                # Per-logo drag/enter bindings
-                self.preview_canvas.tag_bind(
-                    tag, "<ButtonPress-1>",
-                    lambda e, i=idx: self._on_logo_drag_start(e, i))
-                self.preview_canvas.tag_bind(
-                    tag, "<B1-Motion>", self._on_logo_drag_motion)
-                self.preview_canvas.tag_bind(
-                    tag, "<Enter>",
-                    lambda e: self.preview_canvas.configure(cursor="fleur"))
-                self.preview_canvas.tag_bind(
-                    tag, "<Leave>",
-                    lambda e: self.preview_canvas.configure(cursor=""))
-
-            # Handle resize bindings (shared, affects selected logo)
             self.preview_canvas.tag_bind(
-                "handle", "<ButtonPress-1>", self._on_handle_drag_start)
-            self.preview_canvas.tag_bind(
-                "handle", "<B1-Motion>", self._on_handle_drag_motion)
-            self.preview_canvas.tag_bind(
-                "handle", "<ButtonRelease-1>", self._on_handle_drag_end)
-            self.preview_canvas.tag_bind(
-                "handle", "<Enter>",
-                lambda e: self.preview_canvas.configure(cursor="size_nw_se"))
-            self.preview_canvas.tag_bind(
-                "handle", "<Leave>",
-                lambda e: self.preview_canvas.configure(cursor=""))
-
-        except Exception as exc:
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_text(
-                self.preview_canvas.winfo_width() // 2,
-                self.preview_canvas.winfo_height() // 2,
-                text=f"⚠️ ไม่สามารถแสดง preview ได้\n{exc}",
-                fill="#e05555", font=("Helvetica", 12), justify="center",
+                tag, "<ButtonPress-1>",
+                lambda e, i=idx: self._on_logo_drag_start(e, i),
             )
+            self.preview_canvas.tag_bind(
+                tag, "<B1-Motion>", self._on_logo_drag_motion
+            )
+            self.preview_canvas.tag_bind(
+                tag, "<Enter>",
+                lambda e: self.preview_canvas.configure(cursor="fleur"),
+            )
+            self.preview_canvas.tag_bind(
+                tag, "<Leave>",
+                lambda e: self.preview_canvas.configure(cursor=""),
+            )
+
+        self.preview_canvas.tag_bind(
+            "handle", "<ButtonPress-1>", self._on_handle_drag_start
+        )
+        self.preview_canvas.tag_bind(
+            "handle", "<B1-Motion>", self._on_handle_drag_motion
+        )
+        self.preview_canvas.tag_bind(
+            "handle", "<ButtonRelease-1>", self._on_handle_drag_end
+        )
+        self.preview_canvas.tag_bind(
+            "handle", "<Enter>",
+            lambda e: self.preview_canvas.configure(cursor="size_nw_se"),
+        )
+        self.preview_canvas.tag_bind(
+            "handle", "<Leave>",
+            lambda e: self.preview_canvas.configure(cursor=""),
+        )
 
 
     def _schedule_preview(self) -> None:

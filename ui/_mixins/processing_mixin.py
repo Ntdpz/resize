@@ -116,6 +116,17 @@ class ProcessingMixin:
                         state="normal", text="▶  START เริ่มประมวลผล")
                 elif event == "thumb_ready":
                     self._apply_thumb(payload)  # type: ignore[arg-type]
+                elif event == "preview_ready":
+                    self._apply_preview_result(payload)  # type: ignore[arg-type]
+                elif event == "preview_error":
+                    self.preview_canvas.delete("all")
+                    self.preview_canvas.create_text(
+                        self.preview_canvas.winfo_width() // 2,
+                        self.preview_canvas.winfo_height() // 2,
+                        text=f"⚠️ ไม่สามารถแสดง preview ได้\n{payload}",
+                        fill="#e05555", font=("Helvetica", 12),
+                        justify="center",
+                    )
         except queue.Empty:
             pass
         self.after(80, self._poll_events)
